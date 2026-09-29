@@ -86,6 +86,64 @@ async function sendMessageWithRetry(chat, message, keyIndex, attempts = 3) {
   throw lastErr;
 }
 
+// ── Model fallback chain ───────────────────────────────────────────────────────
+// Gemini demand spikes are per model: while one flash model answers 503 "high
+// demand", a sibling model usually answers normally. A request therefore walks
+// this chain instead of being pinned to a single model. Override the order (or
+// trim the list) with GEMINI_MODELS in the environment.
+const MODEL_CHAIN = (process.env.GEMINI_MODELS || [
+  'gemini-3.6-flash',
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash',
+  'gemini-flash-latest',
+].join(','))
+  .split(',')
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+// 503 "model is currently experiencing high demand" and friends are transient
+// upstream conditions — worth another model rather than failing the request.
+const errorStatus = (e) =>
+  Number(e && (e.status || e.statusCode || (e.response && e.response.status))) || 0;
+
+const isOverloadedErr = (e) => {
+  if (errorStatus(e) === 503 || errorStatus(e) === 500) return true;
+  const msg = (e && (e.message || '')) +
+    (e && e.cause ? ' ' + (e.cause.code || e.cause.message || '') : '');
+  return /\b503\b|UNAVAILABLE|overloaded|high demand|service unavailable|internal error|\b500\b|DEADLINE_EXCEEDED|timed ?out/i.test(msg);
+};
+
+// 429s are per API key, so they rotate the key for the same model. Match the
+// status or an explicit rate-limit phrase — deliberately NOT a bare /rate/,
+// because every Gemini error message embeds the request URL and
+// "generateContent" contains "rate", which made every 503 look like a 429 and
+// burn all the API keys.
+const isRateLimitErr = (e) => {
+  if (errorStatus(e) === 429) return true;
+  const msg = (e && (e.message || '')) || '';
+  return /\b429\b|RESOURCE_EXHAUSTED|too many requests|rate limit|rate-limit|quota exceeded/i.test(msg);
+};
+
+const modelCooldownUntil = new Map(); // model name -> timestamp ms
+function markModelOverloaded(model, retryAfterMs = 120000) {
+  modelCooldownUntil.set(model, Date.now() + retryAfterMs);
+  console.warn(`[AI] Model ${model} overloaded, cooling down ${Math.round(retryAfterMs / 1000)}s`);
+}
+
+// Healthy models first (chain order), cooled-down ones last so a request still
+// has somewhere to go when every model is spiking.
+function pickModelOrder() {
+  const now = Date.now();
+  const ready = [];
+  const cooling = [];
+  for (const m of MODEL_CHAIN) {
+    (now >= (modelCooldownUntil.get(m) || 0) ? ready : cooling).push(m);
+  }
+  cooling.sort((a, b) => (modelCooldownUntil.get(a) || 0) - (modelCooldownUntil.get(b) || 0));
+  return [...ready, ...cooling];
+}
+
 // ── Ensure DB tables exist ─────────────────────────────────────────────────────
 async function ensureAITables() {
   try {
@@ -448,72 +506,93 @@ INSTRUCTIONS:
 - When asked for recommendations, base them on the actual data — suggest specific actions for specific underperforming services
 `;
 
-    // ── Key rotation with retry ────────────────────────────────────────────
+    // ── Model fallback + key rotation ──────────────────────────────────────
+    // Two independent failure modes, two independent remedies:
+    //   * 429 / network  → per API key, so rotate the key for the SAME model
+    //   * 503 high demand → per model, so switch the MODEL (same key is fine)
+    // A total attempt budget keeps the worst case bounded instead of walking
+    // every model × key combination while the user waits.
     let lastError = null;
-    const maxRetries = API_KEYS.length; // try every key once
+    let attempts = 0;
+    const MAX_TOTAL_ATTEMPTS = 10;
+    const modelOrder = pickModelOrder();
 
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const { client, keyIndex } = getActiveClient();
+    outer:
+    for (const modelName of modelOrder) {
+      if (attempts >= MAX_TOTAL_ATTEMPTS) break;
 
-      try {
-        const model = client.getGenerativeModel({ model: 'gemini-3.6-flash' });
+      for (let keyTry = 0; keyTry < API_KEYS.length; keyTry++) {
+        if (attempts >= MAX_TOTAL_ATTEMPTS) break outer;
+        const { client, keyIndex } = getActiveClient();
+        attempts++;
 
-        const chatHistory = [];
-        if (history && Array.isArray(history)) {
-          history.forEach(msg => {
-            chatHistory.push({
-              role: msg.role === 'user' ? 'user' : 'model',
-              parts: [{ text: msg.content }],
+        try {
+          const model = client.getGenerativeModel({ model: modelName });
+
+          const chatHistory = [];
+          if (history && Array.isArray(history)) {
+            history.forEach(msg => {
+              chatHistory.push({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: [{ text: msg.content }],
+              });
             });
+          }
+
+          const chat = model.startChat({
+            history: [
+              { role: 'user', parts: [{ text: 'You are the VAS AI Assistant. Analyze the following data and be ready to answer questions.' }] },
+              { role: 'model', parts: [{ text: 'I understand. I am the VAS AI Assistant for Ethio Telecom. I have access to the current VAS revenue data including services, targets, achievements, monthly trends, partners, and alerts. Ask me anything about the VAS performance data.' }] },
+              { role: 'user', parts: [{ text: contextStr }] },
+              { role: 'model', parts: [{ text: 'I have analyzed the VAS data. I can see the revenue achievements, trends, partner performance, and alert statuses. What would you like to know?' }] },
+              ...chatHistory,
+            ],
+            generationConfig: {
+              maxOutputTokens: 8192,
+              temperature: 0.7,
+              topP: 0.9,
+            },
           });
+
+          const result = await sendMessageWithRetry(chat, message, keyIndex);
+          const reply = result.response.text();
+
+          if (modelName !== modelOrder[0]) {
+            console.log(`[AI] Answered by fallback model ${modelName}`);
+          }
+
+          // Success — increment usage
+          await incrementUsage(user_id);
+
+          const remaining = quota.max - (quota.used + 1);
+          return res.json({
+            reply,
+            timestamp: new Date().toISOString(),
+            quota: { used: quota.used + 1, max: quota.max, remaining: Math.max(0, remaining) },
+          });
+        } catch (apiErr) {
+          lastError = apiErr;
+          if (isRateLimitErr(apiErr)) {
+            console.warn(`[AI] Key #${keyIndex + 1} rate-limited (429), rotating to next key...`);
+            markKeyRateLimited(keyIndex, 60000); // cooldown 1 min
+            continue; // try next key with the same model
+          }
+          if (isNetworkErr(apiErr)) {
+            console.warn(`[AI] Key #${keyIndex + 1} unreachable after retries, rotating to next key...`);
+            continue; // network flake — give the next key (same endpoint) a chance
+          }
+          if (isOverloadedErr(apiErr)) {
+            console.warn(`[AI] Model ${modelName} is overloaded, trying the next model...`);
+            markModelOverloaded(modelName);
+            break; // move on to the next model — another key won't help
+          }
+          // Non-transient error (bad request, safety block, ...) — throw immediately
+          throw apiErr;
         }
-
-        const chat = model.startChat({
-          history: [
-            { role: 'user', parts: [{ text: 'You are the VAS AI Assistant. Analyze the following data and be ready to answer questions.' }] },
-            { role: 'model', parts: [{ text: 'I understand. I am the VAS AI Assistant for Ethio Telecom. I have access to the current VAS revenue data including services, targets, achievements, monthly trends, partners, and alerts. Ask me anything about the VAS performance data.' }] },
-            { role: 'user', parts: [{ text: contextStr }] },
-            { role: 'model', parts: [{ text: 'I have analyzed the VAS data. I can see the revenue achievements, trends, partner performance, and alert statuses. What would you like to know?' }] },
-            ...chatHistory,
-          ],
-          generationConfig: {
-            maxOutputTokens: 8192,
-            temperature: 0.7,
-            topP: 0.9,
-          },
-        });
-
-        const result = await sendMessageWithRetry(chat, message, keyIndex);
-        const response = result.response;
-        const reply = response.text();
-
-        // Success — increment usage
-        await incrementUsage(user_id);
-
-        const remaining = quota.max - (quota.used + 1);
-        return res.json({
-          reply,
-          timestamp: new Date().toISOString(),
-          quota: { used: quota.used + 1, max: quota.max, remaining: Math.max(0, remaining) },
-        });
-      } catch (apiErr) {
-        lastError = apiErr;
-        const is429 = apiErr.message?.includes('429') || apiErr.message?.includes('RESOURCE_EXHAUSTED') || apiErr.message?.includes('rate');
-        if (is429) {
-          console.warn(`[AI] Key #${keyIndex + 1} rate-limited (429), rotating to next key...`);
-          markKeyRateLimited(keyIndex, 60000); // cooldown 1 min
-          continue; // try next key
-        }
-        if (isNetworkErr(apiErr)) {
-          console.warn(`[AI] Key #${keyIndex + 1} unreachable after retries, rotating to next key...`);
-          continue; // network flake — give the next key (same endpoint) a chance
-        }
-        // Non-rate-limit error — throw immediately
-        throw apiErr;
       }
     }
 
-    // All keys failed
+    // Every model/key combination failed
     throw lastError || new Error('All API keys exhausted');
   } catch (error) {
     console.error('AI chat error:', error);
@@ -523,13 +602,23 @@ INSTRUCTIONS:
         message: 'The AI service is unreachable from the server right now (network). Please try again in a moment.',
       });
     }
-    if (/429|RESOURCE_EXHAUSTED|All API keys/i.test(error.message || '')) {
+    if (isRateLimitErr(error) || /All API keys/i.test(error.message || '')) {
       return res.status(429).json({
         error: 'quota_exceeded',
         message: 'All AI keys are rate-limited right now. Please try again in a minute.',
       });
     }
-    res.status(500).json({ error: 'AI assistant error', message: error.message });
+    if (isOverloadedErr(error)) {
+      return res.status(503).json({
+        error: 'ai_busy',
+        message: 'The AI models are all busy right now (high demand). Please try again in a minute.',
+      });
+    }
+    // Never surface the raw SDK error to the user — it is already logged above.
+    res.status(500).json({
+      error: 'AI assistant error',
+      message: 'The AI assistant could not answer that. Please try again.',
+    });
   }
 });
 
