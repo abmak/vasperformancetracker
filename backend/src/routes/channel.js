@@ -33,18 +33,56 @@ function requireChannelDataDelete(req, res, next) {
 
 /**
  * Fetch data from eTrade API with timeout and HTTPS handling.
+ *
+ * DNS: the production VPS's systemd-resolved stub (127.0.0.53) intermittently
+ * fails to resolve etrade.gov.et (EAI_AGAIN) even though the host is reachable
+ * — one direct query to 8.8.8.8 answers instantly. Node's dns.lookup() goes
+ * through getaddrinfo and cannot configure fallback servers, so resolve the
+ * host ourselves with a Resolver pinned to public DNS and connect by IP
+ * (SNI + Host header keep TLS and the vhost intact). System resolution is
+ * still tried first, so this stays correct if the VPS DNS is ever fixed.
  */
-function fetchEtradeJson(path) {
+const ETRADE_HOST = 'etrade.gov.et';
+const ETRADE_FALLBACK_RESOLVERS = ['8.8.8.8', '1.1.1.1'];
+
+function resolveEtradeAddr() {
   return new Promise((resolve) => {
-    const req = https.get(`https://etrade.gov.et/${path}`, {
+    require('dns').lookup(ETRADE_HOST, (err, addr) => {
+      if (!err && addr) return resolve(addr);
+      const r = new (require('dns').Resolver)();
+      r.setServers(ETRADE_FALLBACK_RESOLVERS);
+      r.resolve4(ETRADE_HOST, (err2, addrs) => {
+        try { r.cancel(); } catch { /* noop */ }
+        resolve(!err2 && Array.isArray(addrs) && addrs[0] ? addrs[0] : null);
+      });
+    });
+  });
+}
+
+async function fetchEtradeJson(path) {
+  const addr = await resolveEtradeAddr();
+  if (!addr) {
+    return { status: 503, error: 'Cannot resolve etrade.gov.et (DNS failure)' };
+  }
+  return new Promise((resolve) => {
+    const req = https.get(`https://${ETRADE_HOST}/${path}`, {
       rejectUnauthorized: false,
       timeout: 10000,
+      // Pre-resolved address — skip getaddrinfo entirely. Node 20's
+      // autoSelectFamily calls the lookup with all:true and expects an
+      // array of {address, family}; plain calls expect (address, family).
+      lookup: (hostname, options, cb) => {
+        if (typeof options === 'function') { cb = options; options = {}; }
+        if (options && options.all) cb(null, [{ address: addr, family: 4 }]);
+        else cb(null, addr, 4);
+      },
       headers: {
         Accept: 'application/json, text/plain, */*',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) TargetTracking/1.0',
         // eTrade's Registration API checks these — a bare request can be refused.
-        Referer: 'https://etrade.gov.et/',
-        Origin: 'https://etrade.gov.et',
+        Referer: `https://${ETRADE_HOST}/`,
+        Origin: `https://${ETRADE_HOST}`,
+        Host: ETRADE_HOST,
       },
     }, (res) => {
       let data = '';
@@ -1531,7 +1569,18 @@ router.get('/tin-verify/:tin', async (req, res, next) => {
     // Query Ministry of Revenue (MoR) checkTin from eTrade
     const tinRes = await fetchEtradeJson(`api/Tin/checkTin/${encodeURIComponent(tin)}`);
 
-    if (!tinRes || tinRes.status !== 200 || !Array.isArray(tinRes.data) || tinRes.data.length === 0) {
+    // An unreachable / erroring eTrade service must not read as "TIN not
+    // found" — operators would wrongly conclude the business is unregistered.
+    if (!tinRes || tinRes.status >= 500) {
+      return res.status(502).json({
+        found: false,
+        unreachable: true,
+        tin,
+        message: 'The eTrade / Ministry of Revenue service is unreachable right now. Please try again shortly.',
+      });
+    }
+
+    if (!Array.isArray(tinRes.data) || tinRes.data.length === 0) {
       return res.json({
         found: false,
         tin,
@@ -1639,7 +1688,16 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
 
     const tinRes = await fetchEtradeJson(`api/Tin/checkTin/${encodeURIComponent(cleanTin)}`);
 
-    if (!tinRes || tinRes.status !== 200 || !Array.isArray(tinRes.data) || tinRes.data.length === 0) {
+    if (!tinRes || tinRes.status >= 500) {
+      return res.status(502).json({
+        found: false,
+        unreachable: true,
+        tin: cleanTin,
+        message: 'The eTrade / Ministry of Revenue service is unreachable right now. Please try again shortly.',
+      });
+    }
+
+    if (!Array.isArray(tinRes.data) || tinRes.data.length === 0) {
       return res.json({
         found: false,
         tin: cleanTin,
@@ -2031,7 +2089,16 @@ router.post('/tin-verify/batch', async (req, res) => {
           });
         } else {
           failedCount++;
-          results.push({ id: ent.id, tin: cleanTin, success: false, reason: 'Not found on eTrade' });
+          // 5xx / no response means eTrade itself was unreachable — do not
+          // report the TIN as unregistered.
+          const unreachable = !tinRes || tinRes.status >= 500;
+          results.push({
+            id: ent.id,
+            tin: cleanTin,
+            success: false,
+            reason: unreachable ? 'eTrade service unreachable — try again' : 'Not found on eTrade',
+            ...(unreachable ? { unreachable: true } : {}),
+          });
         }
       } catch (e) {
         failedCount++;
