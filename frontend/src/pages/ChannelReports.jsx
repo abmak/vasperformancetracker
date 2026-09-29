@@ -675,7 +675,7 @@ export default function ChannelReports() {
       {activeReport === 'ranking' && topDist && (
         <div className="space-y-6">
           <div className="bg-white rounded-xl border border-gray-200 p-5">
-            <h3 className="text-sm font-semibold text-gray-800 mb-1">Top 10 Owners by Downstream Users</h3>
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Top 3 Owners by Downstream Users</h3>
             <p className="text-xs text-gray-500 mb-4">How many Sub-Distributors and Retailers hang beneath each owner</p>
             {rankingBars.length === 0 ? (
               <p className="text-sm text-gray-400 py-10 text-center">No owner has downstream users yet.</p>

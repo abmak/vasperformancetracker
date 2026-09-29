@@ -168,8 +168,18 @@ router.put('/:id', requirePermission('users.edit', 'channel_users.edit'), async 
       }
     }
     
-    // If password is provided, update it; otherwise keep existing
-    if (password_hash && password_hash !== '***') {
+    // A password is only written when a real new value is supplied — '***' means
+    // "keep current". A value identical to the stored one is also treated as
+    // "keep": re-hashing it would change the hash string while leaving the actual
+    // password alone, which is what makes an update look like it silently worked.
+    const wantsPasswordChange = !!(password_hash && password_hash !== '***');
+    let passwordChanged = false;
+    if (wantsPasswordChange) {
+      passwordChanged = !old[0].password_hash
+        || !(await bcrypt.compare(password_hash, old[0].password_hash));
+    }
+
+    if (passwordChanged) {
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password_hash, salt);
       await pool.query(
@@ -186,7 +196,7 @@ router.put('/:id', requirePermission('users.edit', 'channel_users.edit'), async 
     // Audit trail
     await pool.query(
       'INSERT INTO audit_trail (action, entity_type, entity_id, description, user_name, old_value, new_value) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ['update', 'user', req.params.id, `Updated user: ${full_name}`, req.body.updated_by || 'System', JSON.stringify(old[0]), JSON.stringify({ ...req.body, password_hash: '***' })]
+      ['update', 'user', req.params.id, `Updated user: ${full_name}${passwordChanged ? ' (password changed)' : ''}`, req.body.updated_by || 'System', JSON.stringify(old[0]), JSON.stringify({ ...req.body, password_hash: '***' })]
     );
     
     const [updated] = await pool.query(`
@@ -195,7 +205,10 @@ router.put('/:id', requirePermission('users.edit', 'channel_users.edit'), async 
              r.name as role_name
       FROM users u LEFT JOIN roles r ON u.role_id = r.id WHERE u.id = ?
     `, [req.params.id]);
-    res.json(updated[0]);
+    // password_changed tells the UI whether the submitted value was actually
+    // applied, so a stale/auto-filled value cannot masquerade as a successful
+    // password update.
+    res.json({ ...updated[0], password_changed: passwordChanged });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(400).json({ error: 'Email or username already exists' });

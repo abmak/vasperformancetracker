@@ -356,8 +356,10 @@ export default function Login() {
                 <label className="block text-xs font-medium text-gray-500 mb-2 uppercase tracking-wider">Email or Username</label>
                 <input
                   type="text"
+                  name="username"
+                  autoComplete="username"
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => { setEmail(e.target.value); if (error) setError(''); }}
                   placeholder="admin@ethiotelecom.et"
                   required
                   className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 text-sm focus:ring-2 focus:ring-green-500 focus:border-green-500 outline-none transition-all"
@@ -370,8 +372,10 @@ export default function Login() {
                 <div className="relative">
                   <input
                     type={showPassword ? 'text' : 'password'}
+                    name="password"
+                    autoComplete="current-password"
                     value={password}
-                    onChange={(e) => setPassword(e.target.value)}
+                    onChange={(e) => { setPassword(e.target.value); if (error) setError(''); }}
                     placeholder="Enter your password"
                     required
                     className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 text-sm focus:ring-2 focus:ring-green-500 focus:border-green-500 outline-none transition-all pr-12"

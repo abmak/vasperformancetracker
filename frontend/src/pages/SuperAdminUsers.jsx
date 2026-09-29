@@ -41,6 +41,11 @@ const emptyUser = {
   status: 'active', max_ai_questions_per_day: 50,
 };
 
+// The password box opens holding the '***' sentinel, meaning "keep the current
+// password". Anything else is a real new password.
+const PASSWORD_SENTINEL = '***';
+const hasNewPassword = (value) => !!value && value !== PASSWORD_SENTINEL;
+
 export default function SuperAdminUsers() {
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);
@@ -110,6 +115,13 @@ export default function SuperAdminUsers() {
     setShowModal(true);
   }
 
+  // Clear the sentinel as soon as the field is focused, so typing replaces it
+  // instead of appending ('***newpass') and the password manager cannot leave a
+  // previously saved credential in place.
+  function handlePasswordFocus() {
+    setForm((f) => (f.password_hash === PASSWORD_SENTINEL ? { ...f, password_hash: '' } : f));
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
 
@@ -137,8 +149,15 @@ export default function SuperAdminUsers() {
     try {
       const payload = { ...form, role_id: form.role_id || null };
       if (editingId) {
-        await usersAPI.update(editingId, payload);
-        toast.success('User updated');
+        const updated = await usersAPI.update(editingId, payload);
+        // The server reports whether the password it received differed from the
+        // stored one. If the admin meant to change it and nothing changed, say so
+        // rather than showing a success toast for a no-op.
+        if (hasNewPassword(form.password_hash) && updated?.password_changed === false) {
+          toast.error('Password not changed — the value submitted is the same as the current password. Type a different one.');
+        } else {
+          toast.success('User updated');
+        }
       } else {
         if (!form.password_hash) {
           toast.error('Password is required for new users');
@@ -507,7 +526,8 @@ export default function SuperAdminUsers() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     Password {editingId ? '(leave *** to keep current)' : '*'}
                   </label>
-                  <input type="text" required={!editingId} value={form.password_hash} onChange={(e) => setForm({ ...form, password_hash: e.target.value })}
+                  <input type="text" name="new-user-password" autoComplete="new-password" spellCheck={false} required={!editingId}
+                    value={form.password_hash} onFocus={handlePasswordFocus} onChange={(e) => setForm({ ...form, password_hash: e.target.value })}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
                     placeholder={editingId ? 'Leave *** to keep current' : 'Enter password'} />
                 </div>
