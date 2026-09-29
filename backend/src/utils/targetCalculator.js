@@ -46,11 +46,12 @@ async function ensureTargetAllocationSchema() {
     }
   }
   try {
-    await pool.execute(`ALTER TABLE revenue_targets ADD COLUMN IF NOT EXISTS allocation_mode ENUM('automatic','manual') NOT NULL DEFAULT 'automatic'`);
+    // Plain ADD COLUMN — MySQL (unlike MariaDB) does not support
+    // "ADD COLUMN IF NOT EXISTS"; the duplicate-column error when the column
+    // already exists is expected and ignored.
+    await pool.execute(`ALTER TABLE revenue_targets ADD COLUMN allocation_mode ENUM('automatic','manual') NOT NULL DEFAULT 'automatic'`);
   } catch (e) {
-    // Older MySQL < 8.0.29 lacks IF NOT EXISTS on ADD COLUMN — ignore the
-    // duplicate-column error it raises when the column already exists.
-    if (e.code !== 'ER_DUP_FIELDNAME') {
+    if (e.code !== 'ER_DUP_FIELDNAME' && e.errno !== 1060) {
       console.error('[targetCalculator] allocation_mode column check failed:', e.message);
     }
   }
