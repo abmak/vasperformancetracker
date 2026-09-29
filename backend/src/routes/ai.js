@@ -312,14 +312,19 @@ async function buildVASContext() {
     context.total_revenue = Number(revRows[0]?.total_revenue || 0) + (manualTotal < 1e12 ? manualTotal : 0);
     context.partner_count = Number(revRows[0]?.partner_count || 0);
 
-    const [services] = await pool.execute('SELECT * FROM vas_services ORDER BY name');
+    // Inactive services are hidden from every module — the AI must not
+    // mention or aggregate them either.
+    const [services] = await pool.execute("SELECT * FROM vas_services WHERE status = 'active' ORDER BY name");
+    const activeServiceNames = new Set(services.map((s) => s.name));
     context.services = services.map(s => ({ name: s.name, id: s.id }));
 
-    // Get ALL targets — keep individual rows for multi-target services
+    // Get ALL targets — keep individual rows for multi-target services.
+    // Targets of inactive services are excluded (service hidden everywhere).
     const [targets] = await pool.execute(
       `SELECT rt.id, rt.service_name, rt.target_amount, rt.period_type,
               rt.target_start_date, rt.target_end_date, rt.allocation_mode
        FROM revenue_targets rt
+       WHERE rt.service_id IS NULL OR rt.service_id IN (SELECT id FROM vas_services WHERE status = 'active')
        ORDER BY rt.service_name, rt.target_start_date`
     );
     // Manual-allocation targets carry the admin's month-by-month targets —
@@ -344,7 +349,9 @@ async function buildVASContext() {
     }));
 
     const [svcRevenue] = await pool.execute(
-      `SELECT service_name, SUM(total_revenue) as actual FROM partner_revenue GROUP BY service_name`
+      `SELECT service_name, SUM(total_revenue) as actual FROM partner_revenue
+       WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active')
+       GROUP BY service_name`
     );
     const [manualRevenue] = await pool.execute(
       `SELECT vs.name as service_name, SUM(ar.amount) as actual
@@ -359,7 +366,9 @@ async function buildVASContext() {
     // Per-service monthly revenue breakdown
     const [monthlyByService] = await pool.execute(
       `SELECT service_name, revenue_month, SUM(total_revenue) as revenue
-       FROM partner_revenue GROUP BY service_name, revenue_month
+       FROM partner_revenue
+       WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active')
+       GROUP BY service_name, revenue_month
        ORDER BY service_name, revenue_month`
     );
     context.monthly_by_service = {};
@@ -395,14 +404,18 @@ async function buildVASContext() {
     });
 
     const [monthlyTrend] = await pool.execute(
-      `SELECT revenue_month, SUM(total_revenue) as revenue FROM partner_revenue GROUP BY revenue_month ORDER BY revenue_month`
+      `SELECT revenue_month, SUM(total_revenue) as revenue FROM partner_revenue
+       WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active')
+       GROUP BY revenue_month ORDER BY revenue_month`
     );
     context.monthly_trend = monthlyTrend.map(m => ({ month: m.revenue_month, revenue: Number(m.revenue) }));
 
     const [topPartners] = await pool.execute(
       `SELECT partner_name, SUM(total_revenue) as total_revenue,
               GROUP_CONCAT(DISTINCT service_name) as services
-       FROM partner_revenue GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 10`
+       FROM partner_revenue
+       WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active')
+       GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 10`
     );
     context.top_partners = topPartners.map(p => ({
       name: p.partner_name,

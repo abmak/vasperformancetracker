@@ -97,7 +97,9 @@ export default function Targets() {
       toast.error('Please select a service');
       return;
     }
-    if (!form.target_amount || parseFloat(form.target_amount) <= 0) {
+    // Accept comma-separated amount formats: "2,500,000" — strip separators.
+    const cleanAmount = parseFloat(String(form.target_amount).replace(/[\s,]/g, ''));
+    if (!form.target_amount || Number.isNaN(cleanAmount) || cleanAmount <= 0) {
       toast.error('Please enter a valid target amount');
       return;
     }
@@ -108,7 +110,7 @@ export default function Targets() {
     try {
       const data = {
         ...form,
-        target_amount: parseFloat(form.target_amount),
+        target_amount: cleanAmount,
         fiscal_year: parseInt(form.fiscal_year) || new Date().getFullYear(),
       };
       if (form.service_id) data.service_id = parseInt(form.service_id);
@@ -141,6 +143,11 @@ export default function Targets() {
   // ── Allocation mode & monthly allocation editor ──────────────────────────
   const [allocModal, setAllocModal] = useState(null); // { target, mode, allocations, months }
   const [allocSaving, setAllocSaving] = useState(false);
+  // In-flight free-text of month inputs (comma formatted) — overrides the
+  // formatted display while the user is typing a value like "1,500,0".
+  const [allocText, setAllocText] = useState({});
+  // First month the bulk-paste values fill (defaults to the period's first month)
+  const [allocStartMonth, setAllocStartMonth] = useState('');
 
   function monthsBetween(startStr, endStr) {
     if (!startStr || !endStr) return [];
@@ -161,12 +168,15 @@ export default function Targets() {
       const data = await targetsAPI.getAllocations(t.id);
       const start = data.target_start_date ? String(data.target_start_date).split('T')[0].substring(0, 10) : '';
       const end = data.target_end_date ? String(data.target_end_date).split('T')[0].substring(0, 10) : '';
+      const months = monthsBetween(start, end);
       setAllocModal({
         target: data,
         mode: data.allocation_mode || 'automatic',
         allocations: data.allocations || {},
-        months: monthsBetween(start, end),
+        months,
       });
+      setAllocText({});
+      setAllocStartMonth(months[0] || '');
     } catch (err) {
       toast.error('Failed to load allocation settings');
     }
@@ -177,6 +187,57 @@ export default function Targets() {
       ...prev,
       allocations: { ...prev.allocations, [month]: value === '' ? '' : Number(value) },
     }));
+  }
+
+  // Parse free-text month allocations: accepts comma/space/newline separated
+  // numbers (e.g. "150000000, 120000000, 200000000") and thousands separators
+  // (e.g. "150,000,000"). Values fill the period's months in order; leftover
+  // months are left untouched. Returns { amounts, invalid } for user feedback.
+  function parseAllocText(text, monthCount) {
+    const parts = String(text || '')
+      .split(/[\n,;]/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    const amounts = [];
+    let invalid = 0;
+    for (const p of parts) {
+      const n = Number(p.replace(/[\s,']/g, ''));
+      if (Number.isNaN(n) || n < 0) { invalid++; continue; }
+      amounts.push(n);
+    }
+    return { amounts: amounts.slice(0, monthCount), invalid, extra: Math.max(0, amounts.length - monthCount) };
+  }
+
+  // Bulk-fill month inputs from a comma-separated list, starting at the
+  // selected start month and running forward in period order. Values beyond
+  // the period's last month are ignored. Returns the number of months filled.
+  function applyAllocText(text, startMonth) {
+    if (!allocModal) return 0;
+    const months = allocModal.months;
+    const startIdx = startMonth ? months.indexOf(startMonth) : 0;
+    if (startIdx === -1) {
+      toast.error('Selected start month is outside this target\'s period');
+      return 0;
+    }
+    const capacity = months.length - startIdx;
+    const { amounts, invalid, extra } = parseAllocText(text, capacity);
+    if (amounts.length === 0) {
+      toast.error('No valid numbers found — use comma separated values, e.g. 150000000, 120000000, 200000000');
+      return 0;
+    }
+    const allocations = { ...allocModal.allocations };
+    months.slice(startIdx).forEach((m, i) => {
+      if (i < amounts.length) allocations[m] = amounts[i];
+    });
+    setAllocModal((prev) => ({ ...prev, allocations }));
+    const startLabel = months[startIdx];
+    const [sy, sm] = startLabel.split('-');
+    const startName = new Date(Number(sy), Number(sm) - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+    let msg = `Filled ${amounts.length} month${amounts.length === 1 ? '' : 's'} starting ${startName}`;
+    if (extra > 0) msg += ` — ${extra} extra value${extra === 1 ? '' : 's'} ignored (list longer than the remaining months)`;
+    if (invalid > 0) msg += ` — ${invalid} invalid entr${invalid === 1 ? 'y' : 'ies'} skipped`;
+    toast.success(msg);
+    return amounts.length;
   }
 
   // Split the target equally across every month (starting point for manual editing)
@@ -359,19 +420,70 @@ export default function Targets() {
                     Auto-fill equal split
                   </button>
                 </div>
+
+                {/* Bulk entry: comma separated values, filling from a chosen start month */}
+                {allocModal.months.length > 1 && (
+                  <div className="mb-3">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <select
+                        value={allocStartMonth || allocModal.months[0]}
+                        onChange={(e) => setAllocStartMonth(e.target.value)}
+                        className="border border-gray-300 rounded-lg px-2 py-1.5 text-sm shrink-0"
+                        title="First month the pasted values fill"
+                      >
+                        {allocModal.months.map((m) => {
+                          const [yy, mm] = m.split('-');
+                          const label = new Date(Number(yy), Number(mm) - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                          return <option key={m} value={m}>{label}</option>;
+                        })}
+                      </select>
+                      <span className="text-xs text-gray-400 shrink-0">← values start here</span>
+                      <input
+                        type="text"
+                        placeholder={`Paste comma separated amounts, e.g. ${allocModal.months.map(() => '100000').join(', ')}`}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyAllocText(e.target.value, allocStartMonth || allocModal.months[0]); e.target.value = ''; } }}
+                        className="flex-1 min-w-[200px] border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
+                      />
+                      <button
+                        onClick={(e) => {
+                          const input = e.target.previousElementSibling;
+                          const n = applyAllocText(input.value, allocStartMonth || allocModal.months[0]);
+                          if (n > 0) input.value = '';
+                        }}
+                        className="text-xs px-3 py-1.5 rounded-lg bg-purple-50 hover:bg-purple-100 text-purple-700 font-medium shrink-0"
+                      >
+                        Fill months
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mt-1">Pick the starting month, paste comma separated amounts, then Enter or “Fill months” — values fill forward in period order.</p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-72 overflow-y-auto p-1">
                   {allocModal.months.map((m) => {
                     const [yy, mm] = m.split('-');
                     const label = new Date(Number(yy), Number(mm) - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                    const val = allocModal.allocations[m];
+                    const shown = allocText[m] !== undefined
+                      ? allocText[m]
+                      : (val === '' || val === undefined || val === null ? '' : Number(val).toLocaleString('en-US', { maximumFractionDigits: 2 }));
                     return (
                       <div key={m} className="flex items-center gap-1.5">
                         <span className="text-xs text-gray-600 w-16 shrink-0">{label}</span>
                         <input
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          value={allocModal.allocations[m] ?? ''}
-                          onChange={(e) => setAllocMonth(m, e.target.value)}
+                          type="text"
+                          inputMode="decimal"
+                          value={shown}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setAllocText((prev) => ({ ...prev, [m]: raw }));
+                            const n = parseFloat(raw.replace(/[\s,]/g, ''));
+                            setAllocModal((prev) => ({
+                              ...prev,
+                              allocations: { ...prev.allocations, [m]: raw === '' || Number.isNaN(n) ? '' : n },
+                            }));
+                          }}
+                          onBlur={() => setAllocText((prev) => { const { [m]: _drop, ...rest } = prev; return rest; })}
                           placeholder="0"
                           className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
                         />
@@ -431,7 +543,8 @@ export default function Targets() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Target Amount (ETB) *</label>
-                <input required type="number" min="0" step="0.01" value={form.target_amount} onChange={(e) => setForm({ ...form, target_amount: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="e.g., 2500000" />
+                <input required type="text" inputMode="decimal" min="0" value={form.target_amount} onChange={(e) => setForm({ ...form, target_amount: e.target.value })} className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm" placeholder="e.g., 2,500,000 or 2500000" />
+                <p className="text-xs text-gray-400 mt-1">Commas allowed — 2,500,000 and 2500000 both work</p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Period Type *</label>

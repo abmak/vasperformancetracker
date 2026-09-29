@@ -30,20 +30,22 @@ async function fetchAllData(start_date, end_date, period_value) {
   const { filter, params } = buildFilter(start_date, end_date, period_value);
   const { filter: arFilter, params: arParams } = buildFilter(start_date, end_date, period_value, 'ar');
 
+  // Inactive services are hidden from every module — exclude them from
+  // export totals, lists and achievements.
   const [revRows] = await pool.execute(
     `SELECT COALESCE(SUM(total_revenue), 0) as total_revenue,
             COALESCE(SUM(ethio_share), 0) as ethio_share,
             COUNT(DISTINCT partner_name) as partner_count
-     FROM partner_revenue ${filter}`, params
+     FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}`, params
   );
   const [actRows] = await pool.execute(
     `SELECT COALESCE(SUM(ar.amount), 0) as total_revenue, COUNT(DISTINCT ar.partner_name) as partner_count
-     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}`, arParams
+     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}`, arParams
   );
   const totalRevenue = Number(revRows[0]?.total_revenue || 0) + Number(actRows[0]?.total_revenue || 0);
   const totalPartners = Number(revRows[0]?.partner_count || 0) + Number(actRows[0]?.partner_count || 0);
 
-  const [allServices] = await pool.execute('SELECT * FROM vas_services ORDER BY name');
+  const [allServices] = await pool.execute("SELECT * FROM vas_services WHERE status = 'active' ORDER BY name");
   const [allCategories] = await pool.execute('SELECT * FROM vas_categories ORDER BY name');
 
   let targetFilter = '';
@@ -59,7 +61,7 @@ async function fetchAllData(start_date, end_date, period_value) {
     `SELECT rt.*, COALESCE(vs.name, rt.service_name) as service_name
      FROM revenue_targets rt
      LEFT JOIN vas_services vs ON rt.service_id = vs.id
-     ${targetFilter} ORDER BY rt.service_name`,
+     ${targetFilter ? targetFilter + ' AND (rt.service_id IS NULL OR vs.status = \'active\')' : 'WHERE rt.service_id IS NULL OR vs.status = \'active\''} ORDER BY rt.service_name`,
     targetParams
   );
 
@@ -84,11 +86,11 @@ async function fetchAllData(start_date, end_date, period_value) {
   }
 
   const [serviceData] = await pool.execute(
-    `SELECT service_name, COALESCE(SUM(total_revenue), 0) as actual_amount FROM partner_revenue ${filter} GROUP BY service_name`, params
+    `SELECT service_name, COALESCE(SUM(total_revenue), 0) as actual_amount FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'} GROUP BY service_name`, params
   );
   const [manualData] = await pool.execute(
     `SELECT vs.name as service_name, COALESCE(SUM(ar.amount), 0) as actual_amount
-     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter} GROUP BY vs.name`, arParams
+     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''} GROUP BY vs.name`, arParams
   );
 
   const revenueMap = {};
@@ -105,17 +107,17 @@ async function fetchAllData(start_date, end_date, period_value) {
   const totalTarget = serviceAchievements.reduce((sum, s) => sum + Number(s.target), 0);
 
   const [monthlyTrend] = await pool.execute(
-    `SELECT revenue_month, SUM(total_revenue) as revenue FROM partner_revenue GROUP BY revenue_month ORDER BY revenue_month`, []
+    `SELECT revenue_month, SUM(total_revenue) as revenue FROM partner_revenue WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active') GROUP BY revenue_month ORDER BY revenue_month`, []
   );
 
   // per-service monthly actual revenue (partner + manual) — used for goal cascading
   const [svcMonthlyPartner] = await pool.execute(
     `SELECT service_name, revenue_month, SUM(total_revenue) as revenue
-     FROM partner_revenue ${filter} GROUP BY service_name, revenue_month`, params
+     FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'} GROUP BY service_name, revenue_month`, params
   );
   const [svcMonthlyManual] = await pool.execute(
     `SELECT vs.name as service_name, ar.revenue_month, SUM(ar.amount) as revenue
-     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+     FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
      GROUP BY vs.name, ar.revenue_month`, arParams
   );
   const svcMonthlyMap = {};
@@ -135,12 +137,12 @@ async function fetchAllData(start_date, end_date, period_value) {
   const [topPartners] = await pool.execute(
     `SELECT partner_name, SUM(total_revenue) as total_revenue,
             GROUP_CONCAT(DISTINCT service_name) as services
-     FROM partner_revenue ${filter} GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 10`, params
+     FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'} GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 10`, params
   );
 
   const [allPartnerRevenue] = await pool.execute(
     `SELECT partner_name, service_name, total_revenue, ethio_share, revenue_month
-     FROM partner_revenue ${filter} ORDER BY revenue_month, service_name, total_revenue DESC`, params
+     FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'} ORDER BY revenue_month, service_name, total_revenue DESC`, params
   );
 
   const [allManualRevenue] = await pool.execute(

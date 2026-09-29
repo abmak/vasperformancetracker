@@ -70,6 +70,7 @@ router.get('/', async (req, res) => {
           AND rt.target_start_date > '1000-01-01' AND rt.target_end_date > '1000-01-01'
           AND DATE_FORMAT(rt.target_start_date, '%Y-%m') <= DATE_FORMAT(?, '%Y-%m')
           AND DATE_FORMAT(rt.target_end_date, '%Y-%m') >= DATE_FORMAT(?, '%Y-%m')
+          AND (rt.service_id IS NULL OR vs.status = 'active')
       `;
       if (service_id) { targetQuery += ' AND rt.service_id = ?'; targetParams.push(service_id); }
       if (status) { targetQuery += ' AND rt.status = ?'; targetParams.push(status); }
@@ -89,7 +90,9 @@ router.get('/', async (req, res) => {
 
       const [allT] = await pool.execute(
         `SELECT id, service_id, service_name, target_amount, target_start_date, target_end_date, period_type, allocation_mode
-         FROM revenue_targets WHERE target_amount > 0`
+         FROM revenue_targets
+         WHERE target_amount > 0
+           AND (service_id IS NULL OR service_id IN (SELECT id FROM vas_services WHERE status = 'active'))`
       );
 
       const cascades = [];
@@ -175,7 +178,9 @@ router.get('/:id', async (req, res) => {
       const fE = ymdStr(end_date);
       const [allT] = await pool.execute(
         `SELECT id, service_id, service_name, target_amount, target_start_date, target_end_date, period_type, allocation_mode
-         FROM revenue_targets WHERE service_id = ? AND target_amount > 0`, [c0.service_id]
+         FROM revenue_targets
+         WHERE service_id = ? AND target_amount > 0
+           AND (service_id IS NULL OR service_id IN (SELECT id FROM vas_services WHERE status = 'active'))`, [c0.service_id]
       );
       const win = await buildCascadeWindow(targetsWithStr(allT), fS, fE);
       if (win) {

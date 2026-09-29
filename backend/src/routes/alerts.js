@@ -95,7 +95,8 @@ router.get('/', async (req, res) => {
   try {
     const { start_date, end_date } = req.query;
 
-    // Get all targets with service info
+    // Get all targets with service info — inactive services are hidden from
+    // every module, so their targets are excluded here too.
     let targetQuery = `
       SELECT rt.*,
         COALESCE(vs.name, rt.service_name) as service_name,
@@ -105,6 +106,7 @@ router.get('/', async (req, res) => {
       WHERE rt.target_start_date IS NOT NULL AND rt.target_end_date IS NOT NULL
         AND rt.target_start_date > '1000-01-01' AND rt.target_end_date > '1000-01-01'
         AND DATE(rt.target_start_date) > '1970-01-01'
+        AND (rt.service_id IS NULL OR vs.status = 'active')
     `;
     const targetParams = [];
 
@@ -160,10 +162,12 @@ router.get('/', async (req, res) => {
         `SELECT service_name, revenue_month, SUM(total) as actual FROM (
           SELECT service_name, total_revenue as total, revenue_month FROM partner_revenue
           WHERE service_name IN (${placeholders}) AND revenue_month IN (${monthPlaceholders})
+            AND service_name IN (SELECT name FROM vas_services WHERE status = 'active')
           UNION ALL
           SELECT vs.name as service_name, ar.amount as total, ar.revenue_month
           FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id
           WHERE vs.name IN (${placeholders}) AND ar.revenue_month IN (${monthPlaceholders})
+            AND vs.status = 'active'
         ) combined GROUP BY service_name, revenue_month`,
         [...allServiceNames, ...allMonths, ...allServiceNames, ...allMonths]
       );
@@ -199,22 +203,19 @@ router.get('/', async (req, res) => {
       if (windowMonths.length === 0) continue;
 
       // Monthly breakdown for the window months only.
-      // Expected revenue uses variance CARRY-FORWARD: after each realized month,
-      // its variance (actual - expected) is distributed equally over the remaining
-      // months. A negative variance (shortfall) RAISES the remaining months'
-      // expected; a positive variance (surplus) LOWERS them — so the team always
-      // sees how much is still needed per month to close the gap.
-      // RAW period target: sum of the base monthly shares for the clipped window.
-      // This is the actual target amount for the period (e.g. CRBT 3B over 12 months).
-      // Computed up-front so the monthly breakdown can use it in the catch-up formula.
+      // Expected revenue for each month = the target revenue configured for
+      // that month on the revenue target — the admin's monthly allocation for
+      // manual-allocation targets, or the equal monthly share for automatic
+      // ones (shareMap already carries both). No carry-forward recalculation:
+      // a shortfall in one month no longer reshuffles later months' targets.
+      // RAW period target: sum of the configured monthly targets for the
+      // clipped window (e.g. CRBT 3B over 12 months).
       const rawPeriodTarget = windowMonths.reduce((s, m) => s + (shareMap[m] || 0), 0);
 
       const monthlyBreakdown = [];
       let totalActual = 0;
       let totalExpected = 0;
       let alertCounts = { green: 0, yellow: 0, orange: 0, red: 0, none: 0 };
-      // Cumulative actual collected BEFORE the current month (realized months only).
-      let cumulativeActual = 0;
       const nMonths = windowMonths.length;
 
       for (let mi = 0; mi < nMonths; mi++) {
@@ -223,16 +224,11 @@ router.get('/', async (req, res) => {
         const isPastMonth = month < currentYYYYMM;
         const isCurrentMonth = month === currentYYYYMM;
         const isFutureMonth = !isPastMonth && !isCurrentMonth;
-        // New Monthly Target = (Annual Target - Cumulative Actual) / Remaining Months
-        // Each month's expectation is the amount still needed per remaining month to
-        // reach the period target, based on revenue already collected before it.
-        const remainingMonths = nMonths - mi;
-        const monthExpected = Math.max(0, (rawPeriodTarget - cumulativeActual) / remainingMonths);
+        // The month's expectation is exactly its configured target.
+        const monthExpected = shareMap[month] || 0;
         const alertLevel = isFutureMonth ? 'none' : getAlertLevel(actual, monthExpected);
         const variance = actual - monthExpected;
         const achievementPct = monthExpected > 0 ? ((actual / monthExpected) * 100).toFixed(1) : 0;
-        // Collected revenue accumulates for the remaining months' expectations.
-        cumulativeActual += actual;
 
         monthlyBreakdown.push({
           month,
@@ -324,6 +320,7 @@ router.get('/active', async (req, res) => {
       FROM revenue_targets rt
       LEFT JOIN vas_services vs ON rt.service_id = vs.id
       WHERE rt.target_start_date IS NOT NULL AND rt.target_end_date IS NOT NULL
+        AND (rt.service_id IS NULL OR vs.status = 'active')
       ORDER BY rt.target_start_date ASC
     `);
 

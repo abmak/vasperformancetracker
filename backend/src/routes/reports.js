@@ -66,9 +66,9 @@ router.get('/performance', async (req, res) => {
           SUM(ethio_share) as ethio_amount,
           COUNT(DISTINCT partner_name) as partner_count
          FROM (
-          SELECT service_name, total_revenue as total, ethio_share, partner_name FROM partner_revenue ${actualFilter}
+          SELECT service_name, total_revenue as total, ethio_share, partner_name FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
           UNION ALL
-          SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, 'Manual' as partner_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+          SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, 'Manual' as partner_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
          ) combined
          GROUP BY service_name
          ORDER BY actual_amount DESC`,
@@ -86,13 +86,14 @@ router.get('/performance', async (req, res) => {
         `SELECT rt.*, COALESCE(vs.name, rt.service_name) as service_name
          FROM revenue_targets rt
          LEFT JOIN vas_services vs ON rt.service_id = vs.id
-         ${targetFilter} GROUP BY rt.id`,
+         ${targetFilter ? targetFilter + ' AND (rt.service_id IS NULL OR vs.status = \'active\')' : 'WHERE rt.service_id IS NULL OR vs.status = \'active\''} GROUP BY rt.id`,
         targetParams
       ),
       pool.execute(
         `SELECT vs.name as service_name, vc.name as category_name, vc.color as category_color
          FROM vas_services vs
-         LEFT JOIN vas_categories vc ON vs.category_id = vc.id`
+         LEFT JOIN vas_categories vc ON vs.category_id = vc.id
+         WHERE vs.status = 'active'`
       ).catch(() => [[]]),
     ]);
 
@@ -224,7 +225,8 @@ router.get('/trend', async (req, res) => {
         SUM(ethio_share) as ethio_share,
         COUNT(DISTINCT partner_name) as partner_count
        FROM partner_revenue
-       ${serviceFilter}
+       WHERE service_name IN (SELECT name FROM vas_services WHERE status = 'active')
+       ${serviceFilter ? 'AND ' + serviceFilter.replace('WHERE ', '') : ''}
        GROUP BY revenue_month, service_name
        ORDER BY revenue_month DESC, total_revenue DESC`,
       params
@@ -256,9 +258,9 @@ router.get('/monthly-trend', async (req, res) => {
         COUNT(DISTINCT partner_name) as partner_count,
         COUNT(DISTINCT service_name) as service_count
        FROM (
-        SELECT service_name, total_revenue as total, ethio_share, partner_name, revenue_month FROM partner_revenue ${filter ? filter + ' AND revenue_month IS NOT NULL' : 'WHERE revenue_month IS NOT NULL'}
+        SELECT service_name, total_revenue as total, ethio_share, partner_name, revenue_month FROM partner_revenue ${filter ? filter + ' AND revenue_month IS NOT NULL AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE revenue_month IS NOT NULL AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
-        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, 'Manual' as partner_name, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND ar.revenue_month IS NOT NULL' : 'WHERE ar.revenue_month IS NOT NULL'}
+        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, 'Manual' as partner_name, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND ar.revenue_month IS NOT NULL AND vs.status = \'active\'' : 'WHERE ar.revenue_month IS NOT NULL AND vs.status = \'active\''}
        ) combined
        GROUP BY revenue_month
        ORDER BY revenue_month ASC`,

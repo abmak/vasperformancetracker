@@ -54,6 +54,7 @@ async function getProratedTargets(start_date, end_date) {
     WHERE rt.target_start_date IS NOT NULL AND rt.target_end_date IS NOT NULL
       AND rt.target_start_date > '1000-01-01' AND rt.target_end_date > '1000-01-01'
       AND DATE(rt.target_start_date) > '1970-01-01'
+      AND (rt.service_id IS NULL OR vs.status = 'active')
   `;
   const targetParams = [];
   if (start_date) { targetQuery += ' AND rt.target_end_date >= ?'; targetParams.push(start_date); }
@@ -145,17 +146,17 @@ router.get('/kpis', async (req, res) => {
       ),
       pool.execute(
         `SELECT COUNT(DISTINCT service_name) as count FROM (
-          SELECT service_name FROM partner_revenue ${actualFilter}
+          SELECT service_name FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
           UNION ALL
-          SELECT vs.name as service_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+          SELECT vs.name as service_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
         ) combined`,
         [...actualParams, ...actualParams]
       ),
       pool.execute(
         `SELECT service_name as name, SUM(total) as revenue FROM (
-          SELECT service_name, total_revenue as total FROM partner_revenue ${actualFilter}
+          SELECT service_name, total_revenue as total FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
           UNION ALL
-          SELECT vs.name as service_name, ar.amount as total FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+          SELECT vs.name as service_name, ar.amount as total FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
         ) combined
          GROUP BY service_name
          ORDER BY revenue DESC
@@ -163,7 +164,7 @@ router.get('/kpis', async (req, res) => {
         [...actualParams, ...actualParams]
       ),
       pool.execute(
-        `SELECT partner_name, GROUP_CONCAT(DISTINCT service_name ORDER BY service_name SEPARATOR ', ') as services, SUM(total_revenue) as total_revenue FROM partner_revenue ${actualFilter} GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 5`,
+        `SELECT partner_name, GROUP_CONCAT(DISTINCT service_name ORDER BY service_name SEPARATOR ', ') as services, SUM(total_revenue) as total_revenue FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'} GROUP BY partner_name ORDER BY total_revenue DESC LIMIT 5`,
         actualParams
       ),
     ]);
@@ -176,9 +177,9 @@ router.get('/kpis', async (req, res) => {
     // Build underperforming services from prorated targets
     const [actualByService] = await pool.execute(
       `SELECT service_name, SUM(total) as actual_revenue FROM (
-        SELECT service_name, total_revenue as total FROM partner_revenue ${actualFilter}
+        SELECT service_name, total_revenue as total FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
-        SELECT vs.name as service_name, ar.amount as total FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+        SELECT vs.name as service_name, ar.amount as total FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
       ) combined GROUP BY service_name`,
       [...actualParams, ...actualParams]
     );
@@ -246,20 +247,29 @@ router.get('/service-achievements', async (req, res) => {
         COALESCE(SUM(cr.ethio_share), 0) as ethio_share,
         COUNT(DISTINCT CASE WHEN cr.partner_name != 'Manual' THEN cr.partner_name END) as partner_count
        FROM (
-        SELECT service_name, total_revenue as total, ethio_share, partner_name, revenue_month FROM partner_revenue ${actualFilter}
+        SELECT service_name, total_revenue as total, ethio_share, partner_name, revenue_month FROM partner_revenue ${actualFilter ? actualFilter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
-        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, COALESCE(ar.partner_name, 'Manual') as partner_name, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, COALESCE(ar.partner_name, 'Manual') as partner_name, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
        ) cr
        GROUP BY cr.service_name
        ORDER BY actual_amount DESC`,
       [...actualParams, ...actualParams]
     );
 
+    // Every ACTIVE service must appear — including those with no revenue in
+    // the selected window (shown with 0 actual). Inactive services stay out.
+    const [activeServices] = await pool.execute("SELECT name FROM vas_services WHERE status = 'active'");
+    const activeNames = new Set(activeServices.map((s) => s.name));
+
     // Attach prorated targets and calculate achievement
-    const result = rows.map(r => {
+    const result = [];
+    const seen = new Set();
+    for (const r of rows) {
+      if (!activeNames.has(r.service_name)) continue; // safety net
       const target = proratedTargets[r.service_name] || 0;
       const actual = parseFloat(r.actual_amount) || 0;
-      return {
+      seen.add(r.service_name);
+      result.push({
         service_name: r.service_name,
         actual_amount: actual,
         ethio_share: parseFloat(r.ethio_share) || 0,
@@ -267,8 +277,22 @@ router.get('/service-achievements', async (req, res) => {
         target_amount: target,
         achievement_pct: target > 0 ? parseFloat(((actual / target) * 100).toFixed(2)) : 0,
         remaining: target > actual ? target - actual : 0,
-      };
-    });
+      });
+    }
+    // Active services with no revenue rows in the window
+    for (const s of activeServices) {
+      if (seen.has(s.name)) continue;
+      const target = proratedTargets[s.name] || 0;
+      result.push({
+        service_name: s.name,
+        actual_amount: 0,
+        ethio_share: 0,
+        partner_count: 0,
+        target_amount: target,
+        achievement_pct: 0,
+        remaining: target,
+      });
+    }
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -288,9 +312,9 @@ router.get('/category-breakdown', async (req, res) => {
         SUM(ethio_share) as total_ethio,
         COUNT(DISTINCT partner_name) as partner_count
        FROM (
-        SELECT service_name, total_revenue as total, ethio_share, partner_name FROM partner_revenue ${filter}
+        SELECT service_name, total_revenue as total, ethio_share, partner_name FROM partner_revenue ${filter ? filter + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
-        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, COALESCE(ar.partner_name, 'Manual') as partner_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter}
+        SELECT vs.name as service_name, ar.amount as total, 0 as ethio_share, COALESCE(ar.partner_name, 'Manual') as partner_name FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
        ) combined
        GROUP BY service_name
        ORDER BY total_revenue DESC`,
@@ -323,9 +347,9 @@ router.get('/mom-growth', async (req, res) => {
         service_name, revenue_month,
         SUM(total) as total_revenue
        FROM (
-        SELECT service_name, total_revenue as total, revenue_month FROM partner_revenue ${filter ? filter + ' AND revenue_month IS NOT NULL' : 'WHERE revenue_month IS NOT NULL'}
+        SELECT service_name, total_revenue as total, revenue_month FROM partner_revenue ${filter ? filter + ' AND revenue_month IS NOT NULL AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE revenue_month IS NOT NULL AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
-        SELECT vs.name as service_name, ar.amount as total, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND ar.revenue_month IS NOT NULL' : 'WHERE ar.revenue_month IS NOT NULL'}
+        SELECT vs.name as service_name, ar.amount as total, ar.revenue_month FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arFilter ? arFilter + ' AND ar.revenue_month IS NOT NULL AND vs.status = \'active\'' : 'WHERE ar.revenue_month IS NOT NULL AND vs.status = \'active\''}
        ) combined
        GROUP BY service_name, revenue_month
        ORDER BY service_name, revenue_month`,

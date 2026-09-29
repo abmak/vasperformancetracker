@@ -112,10 +112,10 @@ router.get('/dashboard-kpis', async (req, res) => {
       arWhere = 'WHERE ' + conditions.join(' AND ');
     }
     const srcLabel = `(
-      SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where}
+      SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where ? where + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
       UNION ALL
       SELECT COALESCE(ar.partner_name, 'Manual') as partner_name, vs.name as service_name, ar.amount as total_revenue, 0 as ethio_share
-      FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere}
+      FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere ? arWhere + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
     )`;
     const combinedParams = [...params, ...arParams];
 
@@ -204,10 +204,10 @@ router.get('/summary', async (req, res) => {
     const [rows] = await pool.execute(
       `SELECT service_name, SUM(total_revenue) as total_revenue, SUM(ethio_share) as total_ethio, COUNT(*) as partner_count
        FROM (
-        SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where}
+        SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where ? where + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
         SELECT COALESCE(ar.partner_name, 'Manual') as partner_name, vs.name as service_name, ar.amount as total_revenue, 0 as ethio_share
-        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere}
+        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere ? arWhere + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
        ) combined
        GROUP BY service_name
        ORDER BY total_revenue DESC`,
@@ -271,10 +271,10 @@ router.get('/partners', async (req, res) => {
 
     // Build count query with service filter via subquery
     let countSql = `SELECT COUNT(DISTINCT partner_name) as total FROM (
-      SELECT partner_name, service_name FROM partner_revenue ${dateWhere || ''}
+      SELECT partner_name, service_name FROM partner_revenue ${dateWhere ? dateWhere + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
       UNION ALL
       SELECT COALESCE(ar.partner_name, 'Manual') as partner_name, vs.name as service_name
-      FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere}
+      FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere ? arWhere + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
     ) combined WHERE combined.partner_name IS NOT NULL AND combined.partner_name != ''`;
     const countParams = [...dateParams, ...arParams];
     if (service_name) {
@@ -305,10 +305,10 @@ router.get('/partners', async (req, res) => {
         COUNT(DISTINCT service_name) as service_count,
         COUNT(*) as entry_count
        FROM (
-        SELECT partner_name, service_name, total_revenue, ethio_share, revenue_month FROM partner_revenue ${dateWhere || ''}
+        SELECT partner_name, service_name, total_revenue, ethio_share, revenue_month FROM partner_revenue ${dateWhere ? dateWhere + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
         SELECT COALESCE(ar.partner_name, 'Manual') as partner_name, vs.name as service_name, ar.amount as total_revenue, 0 as ethio_share, ar.revenue_month
-        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere}
+        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere ? arWhere + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
        ) combined
        ${rowWhere}
        GROUP BY partner_name
@@ -457,10 +457,10 @@ router.get('/top-partners', async (req, res) => {
         COUNT(DISTINCT service_name) as service_count,
         COUNT(*) as entry_count
        FROM (
-        SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where}
+        SELECT partner_name, service_name, total_revenue, ethio_share FROM partner_revenue ${where ? where + ' AND service_name IN (SELECT name FROM vas_services WHERE status = \'active\')' : 'WHERE service_name IN (SELECT name FROM vas_services WHERE status = \'active\')'}
         UNION ALL
         SELECT COALESCE(ar.partner_name, 'Manual') as partner_name, vs.name as service_name, ar.amount as total_revenue, 0 as ethio_share
-        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere}
+        FROM actual_revenue ar JOIN vas_services vs ON ar.service_id = vs.id ${arWhere ? arWhere + ' AND vs.status = \'active\'' : 'WHERE vs.status = \'active\''}
        ) combined
        WHERE combined.partner_name IS NOT NULL AND combined.partner_name != '' AND combined.partner_name != 'Manual' ${extraWhere}
        GROUP BY partner_name
