@@ -95,6 +95,9 @@ const MODEL_CHAIN = (process.env.GEMINI_MODELS || [
   'gemini-3.6-flash',
   'gemini-3.8-flash',
   'gemini-3.7-flash',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-3.1-flash-lite',
   'gemini-3.5-flash',
   'gemini-flash-latest',
 ].join(','))
@@ -126,7 +129,10 @@ const isRateLimitErr = (e) => {
 };
 
 const modelCooldownUntil = new Map(); // model name -> timestamp ms
-function markModelOverloaded(model, retryAfterMs = 120000) {
+// A short cool-down only affects which model is tried FIRST on the next
+// request — overloaded models stay in the chain, because the condition clears
+// within seconds and a retry very often succeeds.
+function markModelOverloaded(model, retryAfterMs = 20000) {
   modelCooldownUntil.set(model, Date.now() + retryAfterMs);
   console.warn(`[AI] Model ${model} overloaded, cooling down ${Math.round(retryAfterMs / 1000)}s`);
 }
@@ -142,6 +148,56 @@ function pickModelOrder() {
   }
   cooling.sort((a, b) => (modelCooldownUntil.get(a) || 0) - (modelCooldownUntil.get(b) || 0));
   return [...ready, ...cooling];
+}
+
+// ── Retry plan ─────────────────────────────────────────────────────────────────
+// 503s are transient per request, so one failed attempt is not a verdict: the
+// plan cycles the model chain and the cap keeps a bad moment from making the
+// user wait forever. Override the cap with AI_MAX_ATTEMPTS.
+const MAX_TOTAL_ATTEMPTS = Number(process.env.AI_MAX_ATTEMPTS) || 8;
+
+function buildAttemptPlan() {
+  const order = pickModelOrder();
+  const plan = [];
+  while (plan.length < MAX_TOTAL_ATTEMPTS) plan.push(...order);
+  return plan.slice(0, MAX_TOTAL_ATTEMPTS);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Short, growing pause with jitter between attempts — long enough for a
+// momentary demand spike to pass, short enough not to stall the chat.
+function sleepForRetry(attempt) {
+  return sleep(Math.min(900, attempt * 150) + Math.floor(Math.random() * 150));
+}
+
+// The first four turns seed the conversation with the freshly built VAS
+// context; the rest is the user's own history.
+function buildChat(model, history, contextStr) {
+  const chatHistory = [];
+  if (history && Array.isArray(history)) {
+    history.forEach(msg => {
+      chatHistory.push({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: msg.content }],
+      });
+    });
+  }
+
+  return model.startChat({
+    history: [
+      { role: 'user', parts: [{ text: 'You are the VAS AI Assistant. Analyze the following data and be ready to answer questions.' }] },
+      { role: 'model', parts: [{ text: 'I understand. I am the VAS AI Assistant for Ethio Telecom. I have access to the current VAS revenue data including services, targets, achievements, monthly trends, partners, and alerts. Ask me anything about the VAS performance data.' }] },
+      { role: 'user', parts: [{ text: contextStr }] },
+      { role: 'model', parts: [{ text: 'I have analyzed the VAS data. I can see the revenue achievements, trends, partner performance, and alert statuses. What would you like to know?' }] },
+      ...chatHistory,
+    ],
+    generationConfig: {
+      maxOutputTokens: 8192,
+      temperature: 0.7,
+      topP: 0.9,
+    },
+  });
 }
 
 // ── Ensure DB tables exist ─────────────────────────────────────────────────────
@@ -506,89 +562,59 @@ INSTRUCTIONS:
 - When asked for recommendations, base them on the actual data — suggest specific actions for specific underperforming services
 `;
 
-    // ── Model fallback + key rotation ──────────────────────────────────────
-    // Two independent failure modes, two independent remedies:
-    //   * 429 / network  → per API key, so rotate the key for the SAME model
-    //   * 503 high demand → per model, so switch the MODEL (same key is fine)
-    // A total attempt budget keeps the worst case bounded instead of walking
-    // every model × key combination while the user waits.
+    // ── Model fallback + retry ─────────────────────────────────────────────
+    // Measured behaviour of the 503 "high demand" responses: they are transient
+    // and per request rather than per model — a model answering 503 very often
+    // answers normally seconds later, and the retry lands on a different API
+    // key. So the request walks a plan that cycles the model chain with a short
+    // pause between attempts, instead of giving up on the first spike. 429s are
+    // genuinely per API key, so those rotate the key and retry.
     let lastError = null;
-    let attempts = 0;
-    const MAX_TOTAL_ATTEMPTS = 10;
-    const modelOrder = pickModelOrder();
+    const attemptPlan = buildAttemptPlan();
 
-    outer:
-    for (const modelName of modelOrder) {
-      if (attempts >= MAX_TOTAL_ATTEMPTS) break;
+    for (let attempt = 0; attempt < attemptPlan.length; attempt++) {
+      const modelName = attemptPlan[attempt];
+      const { client, keyIndex } = getActiveClient();
 
-      for (let keyTry = 0; keyTry < API_KEYS.length; keyTry++) {
-        if (attempts >= MAX_TOTAL_ATTEMPTS) break outer;
-        const { client, keyIndex } = getActiveClient();
-        attempts++;
+      if (attempt > 0) await sleepForRetry(attempt);
 
-        try {
-          const model = client.getGenerativeModel({ model: modelName });
+      try {
+        const model = client.getGenerativeModel({ model: modelName });
+        const chat = buildChat(model, history, contextStr);
+        const result = await sendMessageWithRetry(chat, message, keyIndex);
+        const reply = result.response.text();
 
-          const chatHistory = [];
-          if (history && Array.isArray(history)) {
-            history.forEach(msg => {
-              chatHistory.push({
-                role: msg.role === 'user' ? 'user' : 'model',
-                parts: [{ text: msg.content }],
-              });
-            });
-          }
-
-          const chat = model.startChat({
-            history: [
-              { role: 'user', parts: [{ text: 'You are the VAS AI Assistant. Analyze the following data and be ready to answer questions.' }] },
-              { role: 'model', parts: [{ text: 'I understand. I am the VAS AI Assistant for Ethio Telecom. I have access to the current VAS revenue data including services, targets, achievements, monthly trends, partners, and alerts. Ask me anything about the VAS performance data.' }] },
-              { role: 'user', parts: [{ text: contextStr }] },
-              { role: 'model', parts: [{ text: 'I have analyzed the VAS data. I can see the revenue achievements, trends, partner performance, and alert statuses. What would you like to know?' }] },
-              ...chatHistory,
-            ],
-            generationConfig: {
-              maxOutputTokens: 8192,
-              temperature: 0.7,
-              topP: 0.9,
-            },
-          });
-
-          const result = await sendMessageWithRetry(chat, message, keyIndex);
-          const reply = result.response.text();
-
-          if (modelName !== modelOrder[0]) {
-            console.log(`[AI] Answered by fallback model ${modelName}`);
-          }
-
-          // Success — increment usage
-          await incrementUsage(user_id);
-
-          const remaining = quota.max - (quota.used + 1);
-          return res.json({
-            reply,
-            timestamp: new Date().toISOString(),
-            quota: { used: quota.used + 1, max: quota.max, remaining: Math.max(0, remaining) },
-          });
-        } catch (apiErr) {
-          lastError = apiErr;
-          if (isRateLimitErr(apiErr)) {
-            console.warn(`[AI] Key #${keyIndex + 1} rate-limited (429), rotating to next key...`);
-            markKeyRateLimited(keyIndex, 60000); // cooldown 1 min
-            continue; // try next key with the same model
-          }
-          if (isNetworkErr(apiErr)) {
-            console.warn(`[AI] Key #${keyIndex + 1} unreachable after retries, rotating to next key...`);
-            continue; // network flake — give the next key (same endpoint) a chance
-          }
-          if (isOverloadedErr(apiErr)) {
-            console.warn(`[AI] Model ${modelName} is overloaded, trying the next model...`);
-            markModelOverloaded(modelName);
-            break; // move on to the next model — another key won't help
-          }
-          // Non-transient error (bad request, safety block, ...) — throw immediately
-          throw apiErr;
+        if (attempt > 0) {
+          console.log(`[AI] Answered by ${modelName} after ${attempt + 1} attempts`);
         }
+
+        // Success — increment usage
+        await incrementUsage(user_id);
+
+        const remaining = quota.max - (quota.used + 1);
+        return res.json({
+          reply,
+          timestamp: new Date().toISOString(),
+          quota: { used: quota.used + 1, max: quota.max, remaining: Math.max(0, remaining) },
+        });
+      } catch (apiErr) {
+        lastError = apiErr;
+        if (isRateLimitErr(apiErr)) {
+          console.warn(`[AI] Key #${keyIndex + 1} rate-limited (429), rotating to next key...`);
+          markKeyRateLimited(keyIndex, 60000); // cooldown 1 min
+          continue; // same model, different key
+        }
+        if (isNetworkErr(apiErr)) {
+          console.warn(`[AI] Key #${keyIndex + 1} unreachable after retries, rotating to next key...`);
+          continue; // network flake — give the next key (same endpoint) a chance
+        }
+        if (isOverloadedErr(apiErr)) {
+          console.warn(`[AI] ${modelName} reported high demand (attempt ${attempt + 1}/${attemptPlan.length}), retrying...`);
+          markModelOverloaded(modelName);
+          continue; // the plan's next entry is usually a different model
+        }
+        // Non-transient error (bad request, safety block, ...) — throw immediately
+        throw apiErr;
       }
     }
 
