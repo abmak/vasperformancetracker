@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
+const { resolveMonthlyTargets } = require('../utils/targetCalculator');
 
 // Helper: safely convert Date/string to YYYY-MM-DD string
 function toDateStr(val) {
@@ -176,19 +177,16 @@ router.get('/', async (req, res) => {
     const serviceAlerts = [];
 
     for (const [serviceName, svcTargets] of Object.entries(byService)) {
-      // Build a per-month expected map: every target contributes an equal monthly
-      // share (target / its own month count) for each month it covers. Months covered
-      // by two targets get the SUM of both shares.
-      const shareMap = {};
+      // Mode-aware expected map: targets in 'manual' allocation mode contribute
+      // their admin-set monthly allocations; 'automatic' targets keep the legacy
+      // equal monthly share (target / its own month count) for each covered month.
+      // Months covered by multiple targets get the SUM of their contributions.
+      const allMonthly = await resolveMonthlyTargets(svcTargets);
+      const shareMap = allMonthly[serviceName] || {};
       let winStart = null, winEnd = null;
       for (const target of svcTargets) {
         const fullStartDate = toDateStr(target.target_start_date);
         const fullEndDate = toDateStr(target.target_end_date);
-        const monthsInPeriod = getMonthsInPeriod(target.period_type);
-        const monthlyShare = monthsInPeriod > 0 ? (parseFloat(target.target_amount) || 0) / monthsInPeriod : 0;
-        for (const m of getMonthsInRange(fullStartDate, fullEndDate)) {
-          shareMap[m] = (shareMap[m] || 0) + monthlyShare;
-        }
         if (winStart === null || fullStartDate < winStart) winStart = fullStartDate;
         if (winEnd === null || fullEndDate > winEnd) winEnd = fullEndDate;
       }
@@ -333,8 +331,14 @@ router.get('/active', async (req, res) => {
 
     for (const target of targets) {
       const totalTarget = parseFloat(target.target_amount);
-      const monthsInPeriod = getMonthsInPeriod(target.period_type);
-      const monthlyExpected = totalTarget / monthsInPeriod;
+
+      // Mode-aware monthly expectation: manual targets use their admin-set
+      // allocations; automatic targets keep the legacy period-based split.
+      const monthlyMap = (await resolveMonthlyTargets([target]))[target.service_name] || {};
+      const monthlyExpectedFor = (month) =>
+        monthlyMap[month] !== undefined
+          ? monthlyMap[month]
+          : totalTarget / getMonthsInPeriod(target.period_type);
 
       const startDate = toDateStr(target.target_start_date);
       const endDate = toDateStr(target.target_end_date);
@@ -358,14 +362,14 @@ router.get('/active', async (req, res) => {
         );
 
         const actual = parseFloat(revenue[0].actual);
-        const level = getAlertLevel(actual, monthlyExpected);
+        const level = getAlertLevel(actual, monthlyExpectedFor(month));
 
         if (level === 'red') worstLevel = 'red';
         else if (level === 'orange' && worstLevel !== 'red') worstLevel = 'orange';
         else if (level === 'yellow' && worstLevel === 'green') worstLevel = 'yellow';
 
         if (level !== 'green' && level !== 'none') {
-          monthAlerts.push({ month, month_label: getMonthLabel(month), level, actual: Math.round(actual), expected: Math.round(monthlyExpected) });
+          monthAlerts.push({ month, month_label: getMonthLabel(month), level, actual: Math.round(actual), expected: Math.round(monthlyExpectedFor(month)) });
         }
       }
 

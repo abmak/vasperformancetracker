@@ -4,6 +4,7 @@ const pool = require('../config/database');
 const { countUniqueFuzzyPartners } = require('../utils/partnerMerge');
 const { getPartnerCountForRange } = require('../utils/partnerCountCache');
 const { getCached, setCached } = require('../utils/endpointCache');
+const { resolveMonthlyTargets, sumMonthly } = require('../utils/targetCalculator');
 
 // --- Helpers for target proration (same logic as alerts.js) ---
 function toDateStr(val) {
@@ -40,9 +41,10 @@ function getMonthsInPeriod(periodType) {
 
 /**
  * Calculate the prorated target for a service over a filtered date range.
- * For each target record, divides the annual amount by its months-in-period,
- * then sums the monthly shares for the months that fall within the filter.
- * Multiple overlapping targets for the same service are summed.
+ * Mode-aware: targets in 'manual' allocation mode contribute their admin-set
+ * monthly allocations; 'automatic' targets keep the legacy behaviour of
+ * dividing the amount by the months in the filtered overlap. Multiple
+ * overlapping targets for the same service are summed.
  */
 async function getProratedTargets(start_date, end_date) {
   let targetQuery = `
@@ -59,26 +61,11 @@ async function getProratedTargets(start_date, end_date) {
   targetQuery += ' ORDER BY rt.target_start_date ASC';
   const [targets] = await pool.execute(targetQuery, targetParams);
 
-  const result = {}; // service_name -> prorated target amount
-  for (const t of targets) {
-    const serviceName = t.service_name;
-    const fullStartDate = toDateStr(t.target_start_date);
-    const fullEndDate = toDateStr(t.target_end_date);
-    const monthsInPeriod = getMonthsInPeriod(t.period_type);
-    const monthlyShare = monthsInPeriod > 0 ? (parseFloat(t.target_amount) || 0) / monthsInPeriod : 0;
-
-    // Clip to filter range
-    const clipStart = start_date && start_date > fullStartDate ? start_date.substring(0, 7) : fullStartDate.substring(0, 7);
-    const clipEnd = end_date && end_date < fullEndDate ? end_date.substring(0, 7) : fullEndDate.substring(0, 7);
-    const clippedMonths = getMonthsInRange(clipStart + '-01', clipEnd + '-28');
-
-    let prorated = 0;
-    for (const m of clippedMonths) {
-      prorated += monthlyShare;
-    }
-    result[serviceName] = (result[serviceName] || 0) + prorated;
-  }
-  return result; // { service_name: proratedTarget }
+  const monthly = await resolveMonthlyTargets(targets, {
+    startMonth: start_date ? start_date.substring(0, 7) : null,
+    endMonth: end_date ? end_date.substring(0, 7) : null,
+  });
+  return sumMonthly(monthly); // { service_name: proratedTarget }
 }
 
 // Build date filter from start_date/end_date or period_value

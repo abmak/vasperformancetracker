@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { countUniqueFuzzyPartners } = require('../utils/partnerMerge');
 const { getPartnerCountForRange } = require('../utils/partnerCountCache');
+const { resolveMonthlyTargets, sumMonthly } = require('../utils/targetCalculator');
 
 // Build date filter for revenue_month column
 function buildRevenueFilter(start_date, end_date, period_value) {
@@ -82,9 +83,10 @@ router.get('/performance', async (req, res) => {
         [...actualParams, ...actualParams]
       ),
       pool.execute(
-        `SELECT service_name, SUM(target_amount) as total_target 
-         FROM revenue_targets 
-         ${targetFilter} GROUP BY service_name`,
+        `SELECT rt.*, COALESCE(vs.name, rt.service_name) as service_name
+         FROM revenue_targets rt
+         LEFT JOIN vas_services vs ON rt.service_id = vs.id
+         ${targetFilter} GROUP BY rt.id`,
         targetParams
       ),
       pool.execute(
@@ -99,8 +101,28 @@ router.get('/performance', async (req, res) => {
     const endMonth = actualParams[actualParams.length - 1] || null;
     const totalPartners = await getPartnerCountForRange(startMonth, endMonth);
 
+    // Mode-aware targets: manual-allocation targets contribute their admin-set
+    // monthly allocations for the filtered window; automatic targets keep the
+    // legacy "sum of overlapping target amounts" behaviour.
+    const targetRows = allTargets;
+    const targetMonthly = await resolveMonthlyTargets(targetRows, {
+      startMonth: start_date ? start_date.substring(0, 7) : (period_value || null),
+      endMonth: end_date ? end_date.substring(0, 7) : (period_value || null),
+    });
+    const targetTotals = sumMonthly(targetMonthly);
     let targetMap = {};
-    allTargets.forEach(t => { targetMap[t.service_name] = parseFloat(t.total_target); });
+    // Automatic targets: legacy = sum of each overlapping target's full amount.
+    // Manual targets: sum of their in-window allocations (already in targetTotals).
+    const manualServiceNames = new Set(
+      targetRows.filter((t) => t.allocation_mode === 'manual').map((t) => t.service_name)
+    );
+    for (const t of targetRows) {
+      if (t.allocation_mode === 'manual') continue;
+      targetMap[t.service_name] = (targetMap[t.service_name] || 0) + parseFloat(t.target_amount);
+    }
+    for (const [svc, amt] of Object.entries(targetTotals)) {
+      if (manualServiceNames.has(svc)) targetMap[svc] = amt;
+    }
 
     let categoryMap = {};
     (catRows || []).forEach(r => { categoryMap[r.service_name] = { name: r.category_name || 'Other', color: r.category_color || '#6B7280' }; });

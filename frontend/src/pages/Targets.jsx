@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, Edit2, Trash2, X, Check, Target } from 'lucide-react';
+import { Plus, Edit2, Trash2, X, Check, Target, CalendarCog } from 'lucide-react';
 import { targetsAPI, servicesAPI } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { formatCurrency, formatPercent, getAchievementBg, getProgressBarColor } from '../utils/helpers';
@@ -138,6 +138,83 @@ export default function Targets() {
     }
   }
 
+  // ── Allocation mode & monthly allocation editor ──────────────────────────
+  const [allocModal, setAllocModal] = useState(null); // { target, mode, allocations, months }
+  const [allocSaving, setAllocSaving] = useState(false);
+
+  function monthsBetween(startStr, endStr) {
+    if (!startStr || !endStr) return [];
+    const [sy, sm] = startStr.split('-').map(Number);
+    const [ey, em] = endStr.split('-').map(Number);
+    const months = [];
+    let y = sy, m = sm;
+    while (y < ey || (y === ey && m <= em)) {
+      months.push(`${y}-${String(m).padStart(2, '0')}`);
+      m += 1;
+      if (m > 12) { m = 1; y += 1; }
+    }
+    return months;
+  }
+
+  async function openAllocModal(t) {
+    try {
+      const data = await targetsAPI.getAllocations(t.id);
+      const start = data.target_start_date ? String(data.target_start_date).split('T')[0].substring(0, 10) : '';
+      const end = data.target_end_date ? String(data.target_end_date).split('T')[0].substring(0, 10) : '';
+      setAllocModal({
+        target: data,
+        mode: data.allocation_mode || 'automatic',
+        allocations: data.allocations || {},
+        months: monthsBetween(start, end),
+      });
+    } catch (err) {
+      toast.error('Failed to load allocation settings');
+    }
+  }
+
+  function setAllocMonth(month, value) {
+    setAllocModal((prev) => ({
+      ...prev,
+      allocations: { ...prev.allocations, [month]: value === '' ? '' : Number(value) },
+    }));
+  }
+
+  // Split the target equally across every month (starting point for manual editing)
+  function distributeEvenly() {
+    const { target, months } = allocModal;
+    const amount = parseFloat(target.target_amount) || 0;
+    if (months.length === 0 || amount <= 0) return;
+    const per = Math.round((amount / months.length) * 100) / 100;
+    const allocations = {};
+    months.forEach((m, i) => {
+      // Last month absorbs rounding so the total exactly matches the target
+      allocations[m] = i === months.length - 1 ? Math.round((amount - per * (months.length - 1)) * 100) / 100 : per;
+    });
+    setAllocModal((prev) => ({ ...prev, allocations }));
+  }
+
+  function allocTotal() {
+    return Object.values(allocModal?.allocations || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+  }
+
+  async function saveAllocations() {
+    setAllocSaving(true);
+    try {
+      await targetsAPI.setAllocations(allocModal.target.target_id, {
+        allocation_mode: allocModal.mode,
+        allocations: allocModal.mode === 'manual' ? allocModal.allocations : {},
+      });
+      toast.success(allocModal.mode === 'manual'
+        ? 'Manual monthly allocations saved — all reports now use them'
+        : 'Automatic allocation enabled — targets split equally across the period');
+      setAllocModal(null);
+      loadTargets();
+    } catch (err) {
+      toast.error(err.message);
+    }
+    setAllocSaving(false);
+  }
+
   const totalTarget = targets.reduce((s, t) => s + parseFloat(t.target_amount || 0), 0);
 
   // Format date for display
@@ -199,6 +276,7 @@ export default function Targets() {
                   <th className="text-right py-3 px-4 font-semibold text-gray-600">Target Amount</th>
                   <th className="text-center py-3 px-4 font-semibold text-gray-600">Assigned By</th>
                   <th className="text-center py-3 px-4 font-semibold text-gray-600">Notes</th>
+                  <th className="text-center py-3 px-4 font-semibold text-gray-600">Allocation</th>
                   <th className="text-center py-3 px-4 font-semibold text-gray-600">Actions</th>
                 </tr>
               </thead>
@@ -219,7 +297,15 @@ export default function Targets() {
                     <td className="text-center py-3 px-4 text-gray-600">{t.assigned_by}</td>
                     <td className="text-center py-3 px-4 text-gray-500 text-xs max-w-[200px] truncate">{t.notes}</td>
                     <td className="text-center py-3 px-4">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                        (t.allocation_mode === 'manual') ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-700'
+                      }`}>
+                        {t.allocation_mode === 'manual' ? 'Monthly manual' : 'Auto split'}
+                      </span>
+                    </td>
+                    <td className="text-center py-3 px-4">
                       <div className="flex items-center justify-center gap-1">
+                        {canEdit && <button onClick={() => openAllocModal(t)} title="Allocation mode & monthly targets" className="p-1.5 rounded hover:bg-gray-100 text-gray-400 hover:text-purple-600"><CalendarCog size={14} /></button>}
                         {canEdit && <button onClick={() => openEdit(t)} className="p-1.5 rounded hover:bg-gray-100 text-gray-400 hover:text-blue-600"><Edit2 size={14} /></button>}
                         {canDelete && <button onClick={() => handleDelete(t.id)} className="p-1.5 rounded hover:bg-gray-100 text-gray-400 hover:text-red-600"><Trash2 size={14} /></button>}
                       </div>
@@ -227,10 +313,94 @@ export default function Targets() {
                   </tr>
                 ))}
                 {targets.length === 0 && (
-                  <tr><td colSpan={8} className="text-center py-12 text-gray-400">No targets found for this date range</td></tr>
+                  <tr><td colSpan={9} className="text-center py-12 text-gray-400">No targets found for this date range</td></tr>
                 )}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* Allocation Mode & Monthly Allocation Modal */}
+      {allocModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl mx-4 p-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="text-lg font-semibold">Target Allocation — {allocModal.target.service_name}</h2>
+              <button onClick={() => setAllocModal(null)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+            </div>
+            <p className="text-xs text-gray-500 mb-4">
+              Period: {allocModal.target.target_start_date ? String(allocModal.target.target_start_date).split('T')[0] : '-'} → {allocModal.target.target_end_date ? String(allocModal.target.target_end_date).split('T')[0] : '-'} · Total {formatCurrency(allocModal.target.target_amount)}
+            </p>
+
+            {/* Mode toggle */}
+            <div className="grid grid-cols-2 gap-3 mb-4">
+              <button
+                onClick={() => setAllocModal({ ...allocModal, mode: 'automatic' })}
+                className={`text-left p-3 rounded-lg border-2 transition ${allocModal.mode === 'automatic' ? 'border-blue-600 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
+              >
+                <div className="font-medium text-sm text-gray-900">⚡ Automatic</div>
+                <div className="text-xs text-gray-500 mt-0.5">Target split equally across every month of the period (current logic)</div>
+              </button>
+              <button
+                onClick={() => setAllocModal({ ...allocModal, mode: 'manual' })}
+                className={`text-left p-3 rounded-lg border-2 transition ${allocModal.mode === 'manual' ? 'border-purple-600 bg-purple-50' : 'border-gray-200 hover:border-gray-300'}`}
+              >
+                <div className="font-medium text-sm text-gray-900">📅 Manual monthly</div>
+                <div className="text-xs text-gray-500 mt-0.5">You allocate the target for each month — all reports compare actual vs these amounts</div>
+              </button>
+            </div>
+
+            {allocModal.mode === 'manual' && (
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-gray-700">Monthly target allocation (ETB)</label>
+                  <button onClick={distributeEvenly} className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium">
+                    Auto-fill equal split
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-72 overflow-y-auto p-1">
+                  {allocModal.months.map((m) => {
+                    const [yy, mm] = m.split('-');
+                    const label = new Date(Number(yy), Number(mm) - 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                    return (
+                      <div key={m} className="flex items-center gap-1.5">
+                        <span className="text-xs text-gray-600 w-16 shrink-0">{label}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={allocModal.allocations[m] ?? ''}
+                          onChange={(e) => setAllocMonth(m, e.target.value)}
+                          placeholder="0"
+                          className="w-full border border-gray-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="flex items-center justify-between mt-3 text-sm">
+                  <span className="text-gray-500">Allocated total: <span className="font-semibold text-gray-900">{formatCurrency(allocTotal())}</span></span>
+                  <span className={Math.abs(allocTotal() - parseFloat(allocModal.target.target_amount || 0)) < 0.01 ? 'text-green-600 text-xs' : 'text-amber-600 text-xs'}>
+                    {Math.abs(allocTotal() - parseFloat(allocModal.target.target_amount || 0)) < 0.01
+                      ? '✓ matches target amount'
+                      : `Target is ${formatCurrency(allocModal.target.target_amount)} — you can allocate more or less if intended`}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {allocModal.mode === 'automatic' && (
+              <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-gray-600">
+                With <b>Automatic</b>, {formatCurrency(allocModal.target.target_amount)} is divided equally across the {allocModal.months.length} month(s) of the period — {formatCurrency(allocModal.months.length > 0 ? (parseFloat(allocModal.target.target_amount) || 0) / allocModal.months.length : 0)} per month. This is the existing behaviour used by reports, alerts and the dashboard.
+              </div>
+            )}
+
+            <div className="flex justify-end gap-3 pt-4">
+              <button type="button" onClick={() => setAllocModal(null)} className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">Cancel</button>
+              <button onClick={saveAllocations} disabled={allocSaving} className="px-4 py-2 text-sm text-white bg-purple-600 rounded-lg hover:bg-purple-700 flex items-center gap-1 disabled:opacity-50">
+                <Check size={14} /> {allocSaving ? 'Saving…' : 'Save'}</button>
+            </div>
           </div>
         </div>
       )}

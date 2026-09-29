@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
+const { resolveMonthlyTargets } = require('../utils/targetCalculator');
 
 // Create goal_cascades table (keyed by service + period dates, no fiscal-year unique)
 async function ensureTable() {
@@ -87,7 +88,7 @@ router.get('/', async (req, res) => {
       }
 
       const [allT] = await pool.execute(
-        `SELECT id, service_id, target_amount, target_start_date, target_end_date, period_type
+        `SELECT id, service_id, service_name, target_amount, target_start_date, target_end_date, period_type, allocation_mode
          FROM revenue_targets WHERE target_amount > 0`
       );
 
@@ -98,7 +99,7 @@ router.get('/', async (req, res) => {
           ? { ...stored, service_name: svc.service_name, service_name_fallback: svc.service_name, service_code: svc.service_code }
           : { id: -(svc.service_id || 0), service_id: svc.service_id, service_name: svc.service_name, service_name_fallback: svc.service_name, service_code: svc.service_code, cascade_method: 'equal', status: 'active', annual_target: 0 };
         const svcTargets = targetsWithStr(allT.filter(t => t.service_id === svc.service_id));
-        const win = buildCascadeWindow(svcTargets, fS, fE);
+        const win = await buildCascadeWindow(svcTargets, fS, fE);
         if (!win) continue;
         c.annual_target = win.target;
         c.target_start_date = win.start;
@@ -173,10 +174,10 @@ router.get('/:id', async (req, res) => {
       const fS = ymdStr(start_date);
       const fE = ymdStr(end_date);
       const [allT] = await pool.execute(
-        `SELECT id, service_id, target_amount, target_start_date, target_end_date, period_type
+        `SELECT id, service_id, service_name, target_amount, target_start_date, target_end_date, period_type, allocation_mode
          FROM revenue_targets WHERE service_id = ? AND target_amount > 0`, [c0.service_id]
       );
-      const win = buildCascadeWindow(targetsWithStr(allT), fS, fE);
+      const win = await buildCascadeWindow(targetsWithStr(allT), fS, fE);
       if (win) {
         const built = buildCascadeItems(serviceName, win.start, win.end, win.months);
         await fillCascadeActuals(serviceName, built.all);
@@ -353,10 +354,29 @@ router.post('/auto-generate', async (req, res) => {
 
       // Use the FULL primary target amount (the target's own window defines the
       // amount; no month pro-rating) so e.g. a 10B yearly target stays 10B.
-      const amount = parseFloat(primary.target_amount) || 0;
+      // Manual-allocation targets: the cascade amount is the sum of the admin-set
+      // monthly allocations inside the cascade window, and the items distribute
+      // those real month values instead of an equal split.
+      const manualSiblings = overlapping.filter(t => t.allocation_mode === 'manual');
+      let amount = 0;
+      let monthlyMap = null;
+      if (manualSiblings.length > 0) {
+        const manualMonthly = await resolveMonthlyTargets(manualSiblings);
+        monthlyMap = {};
+        for (const t of manualSiblings) {
+          const m = manualMonthly[t.service_name] || {};
+          for (const [k, v] of Object.entries(m)) monthlyMap[k] = (monthlyMap[k] || 0) + v;
+        }
+        const winStart = monthOf(start), winEnd = monthOf(end);
+        amount = Object.entries(monthlyMap)
+          .filter(([k]) => (!winStart || k >= winStart) && (!winEnd || k <= winEnd))
+          .reduce((s, [, v]) => s + v, 0);
+      } else {
+        amount = parseFloat(primary.target_amount) || 0;
+      }
       if (amount <= 0) continue;
 
-      const cascadeId = await upsertCascade(service.id, service.name, amount, start, end, 'equal', created_by || 'System');
+      const cascadeId = await upsertCascade(service.id, service.name, amount, start, end, manualSiblings.length ? 'manual' : 'equal', created_by || 'System', monthlyMap);
       results.push({ service: service.name, annual_target: amount, start, end, cascade_id: cascadeId });
     }
 
@@ -393,7 +413,7 @@ router.post('/refresh-achievements', async (req, res) => {
 /* =========================================================
    CASCADE IDENTITY / UPSERT — one cascade per (service, period)
    ========================================================= */
-async function upsertCascade(serviceId, serviceName, amount, start, end, method, createdBy) {
+async function upsertCascade(serviceId, serviceName, amount, start, end, method, createdBy, monthlyMap = null) {
   // A service keeps a single active cascade matching the currently selected
   // period, so clear any previously generated cascades for it before recreating.
   await pool.execute('DELETE FROM goal_cascades WHERE service_id = ?', [serviceId]);
@@ -406,7 +426,7 @@ async function upsertCascade(serviceId, serviceName, amount, start, end, method,
   );
   const cascadeId = result.insertId;
 
-  await generateCascadeItems(cascadeId, amount, start, end);
+  await generateCascadeItems(cascadeId, amount, start, end, monthlyMap);
   await updateCascadeAchievement(cascadeId);
   return cascadeId;
 }
@@ -433,7 +453,11 @@ function monthsBetweenStr(a, b) {
    GENERATION — builds yearly / semi-annual / quarterly items
    over the exact month span of the period.
    ========================================================= */
-async function generateCascadeItems(cascadeId, annualTarget, startDate, endDate) {
+async function generateCascadeItems(cascadeId, annualTarget, startDate, endDate, monthlyMap = null) {
+  // monthlyMap: optional { 'YYYY-MM': amount } — admin-set allocations. When
+  // present, every bucket (year/semi/quarter) sums the actual month values
+  // (missing months fall back to the equal share), so a manually allocated
+  // fiscal year cascades with the real month-by-month numbers.
   const s = parseYmd(startDate);
   const e = parseYmd(endDate);
   if (!s || !e) throw new Error('Valid start/end dates are required');
@@ -447,6 +471,13 @@ async function generateCascadeItems(cascadeId, annualTarget, startDate, endDate)
   }
   const totalMonths = months.length;
   const yearStr = `${s.y}`;
+  const equalShare = annualTarget / totalMonths;
+  const monthAmt = (key) =>
+    monthlyMap && monthlyMap[key] !== undefined ? monthlyMap[key] : equalShare;
+  const groupAmt = (group) =>
+    monthlyMap
+      ? group.reduce((sum, mo) => sum + monthAmt(`${mo.y}-${String(mo.m).padStart(2, '0')}`), 0)
+      : annualTarget * (group.length / totalMonths);
 
   const [yRes] = await pool.execute(
     `INSERT INTO goal_cascade_items (cascade_id, level, period_label, period_start, period_end, target_amount, weight)
@@ -458,7 +489,7 @@ async function generateCascadeItems(cascadeId, annualTarget, startDate, endDate)
   for (let i = 0; i < months.length; i += 6) {
     const group = months.slice(i, i + 6);
     if (group.length === 0) continue;
-    const share = annualTarget * (group.length / totalMonths);
+    const share = groupAmt(group);
     const label = `H${Math.floor(i / 6) + 1}-${yearStr} (Semi)`;
     const [sRes] = await pool.execute(
       `INSERT INTO goal_cascade_items (cascade_id, level, period_label, period_start, period_end, target_amount, weight, parent_item_id)
@@ -470,7 +501,7 @@ async function generateCascadeItems(cascadeId, annualTarget, startDate, endDate)
     for (let j = 0; j < group.length; j += 3) {
       const qGroup = group.slice(j, j + 3);
       if (qGroup.length === 0) continue;
-      const qShare = annualTarget * (qGroup.length / totalMonths);
+      const qShare = groupAmt(qGroup);
       const qLabel = `Q${Math.floor(i / 6) * 2 + Math.floor(j / 3) + 1}-${yearStr} (Qtr)`;
       await pool.execute(
         `INSERT INTO goal_cascade_items (cascade_id, level, period_label, period_start, period_end, target_amount, weight, parent_item_id)
@@ -539,7 +570,7 @@ function targetsWithStr(rows) {
     .filter(t => t.startStr && t.endStr);
 }
 
-function buildCascadeWindow(targets, fS, fE) {
+async function buildCascadeWindow(targets, fS, fE) {
   // Merge ALL revenue targets that overlap the filter window (month-wise), so a
   // service with two targets gets BOTH added for the months they each cover.
   const pStart = monthOf(fS);
@@ -563,23 +594,46 @@ function buildCascadeWindow(targets, fS, fE) {
   const end = earlierDate(maxEnd, fE);
   if (start > end) return null;
 
-  // Build a per-month share array: every overlapping target contributes an equal
-  // monthly share (target / its own month count) for each month it covers. Months
-  // covered by two targets get the SUM of both shares.
+  // Build a per-month share array. Mode-aware: targets in 'manual' allocation
+  // mode contribute their admin-set monthly allocations; 'automatic' targets
+  // contribute an equal monthly share (target / its own month count) for each
+  // month they cover. Months covered by multiple targets get the SUM.
+  const manualOnly = overlap.filter(t => t.allocation_mode === 'manual');
+  const allocMonthly = await resolveMonthlyTargets(manualOnly);
+  const allocFor = {};
+  for (const t of overlap) {
+    if (t.allocation_mode === 'manual') continue;
+    const ts = monthOf(t.startStr);
+    const te = monthOf(t.endStr);
+    const tMonths = monthsBetween(t.startStr, t.endStr);
+    const share = tMonths > 0 ? (parseFloat(t.target_amount) || 0) / tMonths : 0;
+    let y2 = parseInt(ts.substring(0, 4), 10), m2 = parseInt(ts.substring(5, 7), 10);
+    const eY2 = parseInt(te.substring(0, 4), 10), eM2 = parseInt(te.substring(5, 7), 10);
+    while (y2 < eY2 || (y2 === eY2 && m2 <= eM2)) {
+      const key = `${y2}-${String(m2).padStart(2, '0')}`;
+      allocFor[key] = (allocFor[key] || 0) + share;
+      m2 += 1;
+      if (m2 > 12) { m2 = 1; y2 += 1; }
+    }
+  }
+  // resolveMonthlyTargets keys by service_name; manual targets keep the real
+  // name from the row (service_id-less rows fall back to it as well).
+  const manualMap = {};
+  for (const t of manualOnly) {
+    const m = allocMonthly[t.service_name] || {};
+    for (const [k, v] of Object.entries(m)) {
+      manualMap[k] = (manualMap[k] || 0) + v;
+    }
+  }
+
   const months = [];
   let y = parseYmd(start).y, m = parseYmd(start).m;
   const eY = parseYmd(end).y, eM = parseYmd(end).m;
   while (y < eY || (y === eY && m <= eM)) {
     const key = `${y}-${String(m).padStart(2, '0')}`;
-    let share = 0;
-    for (const t of overlap) {
-      const ts = monthOf(t.startStr);
-      const te = monthOf(t.endStr);
-      if (key >= ts && key <= te) {
-        const tMonths = monthsBetween(t.startStr, t.endStr);
-        share += tMonths > 0 ? (parseFloat(t.target_amount) || 0) / tMonths : 0;
-      }
-    }
+    const manualAmt = manualMap[key] !== undefined ? manualMap[key] : 0;
+    const autoAmt = allocFor[key] !== undefined ? allocFor[key] : 0;
+    const share = manualAmt + autoAmt;
     months.push({ y, m, share });
     m += 1;
     if (m > 12) { m = 1; y += 1; }

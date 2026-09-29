@@ -2,6 +2,104 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
 const { requirePermission } = require('../middleware/permissions');
+const { ensureTargetAllocationSchema } = require('../utils/targetCalculator');
+
+// ── Target allocation mode & monthly allocations (admin feature) ─────────────
+// 'automatic' = legacy equal split across the period; 'manual' = the admin
+// allocates a target amount for each month of the fiscal period and every
+// report/alert/dashboard uses those month values vs actual revenue.
+
+// GET /api/targets/:id/allocations — mode + monthly allocations for one target
+router.get('/:id/allocations', requirePermission('targets.edit'), async (req, res) => {
+  try {
+    await ensureTargetAllocationSchema();
+    const [rows] = await pool.execute('SELECT * FROM revenue_targets WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Target not found' });
+    const t = rows[0];
+    const [allocs] = await pool.execute(
+      'SELECT target_month, allocated_amount FROM revenue_target_allocations WHERE target_id = ? ORDER BY target_month',
+      [req.params.id]
+    );
+    const allocations = {};
+    allocs.forEach(a => { allocations[a.target_month] = parseFloat(a.allocated_amount); });
+    res.json({
+      target_id: t.id,
+      service_id: t.service_id,
+      service_name: t.service_name,
+      target_amount: parseFloat(t.target_amount),
+      period_type: t.period_type,
+      target_start_date: t.target_start_date,
+      target_end_date: t.target_end_date,
+      allocation_mode: t.allocation_mode || 'automatic',
+      allocations,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/targets/:id/allocations — set mode and/or replace monthly allocations
+// Body: { allocation_mode?: 'automatic'|'manual', allocations?: { 'YYYY-MM': amount } }
+router.put('/:id/allocations', requirePermission('targets.edit'), async (req, res) => {
+  try {
+    await ensureTargetAllocationSchema();
+    const [rows] = await pool.execute('SELECT * FROM revenue_targets WHERE id = ?', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Target not found' });
+    const t = rows[0];
+    const { allocation_mode, allocations } = req.body || {};
+
+    if (allocation_mode !== undefined && !['automatic', 'manual'].includes(allocation_mode)) {
+      return res.status(400).json({ error: "allocation_mode must be 'automatic' or 'manual'" });
+    }
+
+    if (allocation_mode !== undefined && allocation_mode !== (t.allocation_mode || 'automatic')) {
+      await pool.execute('UPDATE revenue_targets SET allocation_mode = ? WHERE id = ?', [allocation_mode, t.id]);
+      await pool.execute(
+        'INSERT INTO audit_trail (action, entity_type, entity_id, description, user_name, new_value) VALUES (?, ?, ?, ?, ?, ?)',
+        ['update', 'target', t.id, `Target allocation mode set to ${allocation_mode} for ${t.service_name}`, req.body.user_name || 'System', JSON.stringify({ from: t.allocation_mode || 'automatic', to: allocation_mode })]
+      );
+    }
+
+    if (allocations !== undefined) {
+      if (typeof allocations !== 'object' || allocations === null) {
+        return res.status(400).json({ error: 'allocations must be an object of { "YYYY-MM": amount }' });
+      }
+      // Replace-all semantics — the UI always sends the complete month map.
+      await pool.execute('DELETE FROM revenue_target_allocations WHERE target_id = ?', [t.id]);
+      const entries = Object.entries(allocations).filter(([, v]) => v !== null && v !== '' && !Number.isNaN(Number(v)));
+      for (const [month, amount] of entries) {
+        if (!/^\d{4}-\d{2}$/.test(month)) {
+          return res.status(400).json({ error: `Invalid month key: ${month} (expected YYYY-MM)` });
+        }
+        await pool.execute(
+          'INSERT INTO revenue_target_allocations (target_id, service_id, service_name, target_month, allocated_amount) VALUES (?, ?, ?, ?, ?)',
+          [t.id, t.service_id || null, t.service_name || null, month, Number(amount)]
+        );
+      }
+      const saved = entries.length;
+      await pool.execute(
+        'INSERT INTO audit_trail (action, entity_type, entity_id, description, user_name, new_value) VALUES (?, ?, ?, ?, ?, ?)',
+        ['update', 'target', t.id, `Saved ${saved} monthly target allocations for ${t.service_name}`, req.body.user_name || 'System', JSON.stringify(allocations)]
+      );
+    }
+
+    const [allocs] = await pool.execute(
+      'SELECT target_month, allocated_amount FROM revenue_target_allocations WHERE target_id = ? ORDER BY target_month',
+      [t.id]
+    );
+    const result = {};
+    allocs.forEach(a => { result[a.target_month] = parseFloat(a.allocated_amount); });
+    const [updated] = await pool.execute('SELECT allocation_mode FROM revenue_targets WHERE id = ?', [t.id]);
+    res.json({
+      target_id: t.id,
+      allocation_mode: updated[0]?.allocation_mode || 'automatic',
+      allocations: result,
+      allocated_total: Object.values(result).reduce((s, v) => s + v, 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // GET all targets with service info - support date range filtering
 router.get('/', async (req, res) => {

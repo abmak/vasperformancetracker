@@ -43,6 +43,9 @@ export const targetsAPI = {
   create: (data) => request('/targets', { method: 'POST', body: data }),
   update: (id, data) => request(`/targets/${id}`, { method: 'PUT', body: data }),
   delete: (id) => request(`/targets/${id}`, { method: 'DELETE' }),
+  // Allocation mode ('automatic' | 'manual') and month-by-month target amounts
+  getAllocations: (id) => request(`/targets/${id}/allocations`),
+  setAllocations: (id, data) => request(`/targets/${id}/allocations`, { method: 'PUT', body: data }),
 };
 
 // Revenue

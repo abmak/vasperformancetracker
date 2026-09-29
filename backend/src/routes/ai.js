@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const pool = require('../config/database');
+const targetCalculator = require('../utils/targetCalculator');
 
 // Optional egress proxy — the production VPS's international link is
 // intermittent; set AI_PROXY_URL in .env.production to route Gemini traffic
@@ -317,16 +318,29 @@ async function buildVASContext() {
     // Get ALL targets — keep individual rows for multi-target services
     const [targets] = await pool.execute(
       `SELECT rt.id, rt.service_name, rt.target_amount, rt.period_type,
-              rt.target_start_date, rt.target_end_date
+              rt.target_start_date, rt.target_end_date, rt.allocation_mode
        FROM revenue_targets rt
        ORDER BY rt.service_name, rt.target_start_date`
     );
+    // Manual-allocation targets carry the admin's month-by-month targets —
+    // include them so AI answers match what reports show for those services.
+    let allocByTarget = {};
+    try {
+      await targetCalculator.ensureReady();
+      allocByTarget = await targetCalculator.getAllocationsByTarget(
+        targets.filter((t) => t.allocation_mode === 'manual').map((t) => t.id)
+      );
+    } catch (e) {
+      console.error('[AI] target allocations unavailable:', e.message);
+    }
     context.targets = targets.map(t => ({
       service: t.service_name,
       target: Number(t.target_amount),
       period: t.period_type,
       start: t.target_start_date,
       end: t.target_end_date,
+      allocation_mode: t.allocation_mode || 'automatic',
+      monthly_allocations: t.allocation_mode === 'manual' ? allocByTarget[t.id] || {} : undefined,
     }));
 
     const [svcRevenue] = await pool.execute(

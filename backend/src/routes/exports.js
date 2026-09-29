@@ -55,13 +55,33 @@ async function fetchAllData(start_date, end_date, period_value) {
     targetFilter = 'WHERE period_value = ?';
     targetParams.push(period_value);
   }
-  const [allTargets] = await pool.execute(`SELECT * FROM revenue_targets ${targetFilter} ORDER BY service_name`, targetParams);
-  const [targetSummary] = await pool.execute(
-    `SELECT service_name, SUM(target_amount) as total_target FROM revenue_targets ${targetFilter} GROUP BY service_name`, targetParams
+  const [allTargets] = await pool.execute(
+    `SELECT rt.*, COALESCE(vs.name, rt.service_name) as service_name
+     FROM revenue_targets rt
+     LEFT JOIN vas_services vs ON rt.service_id = vs.id
+     ${targetFilter} ORDER BY rt.service_name`,
+    targetParams
   );
 
+  // Mode-aware target map: manual-allocation targets contribute their admin-set
+  // monthly allocations for the window; automatic targets keep the legacy
+  // "sum of overlapping target amounts" behaviour.
+  const { resolveMonthlyTargets, sumMonthly } = require('../utils/targetCalculator');
+  const manualNames = new Set(allTargets.filter(t => t.allocation_mode === 'manual').map(t => t.service_name));
+  const targetMonthly = await resolveMonthlyTargets(allTargets, {
+    startMonth: start_date ? start_date.substring(0, 7) : (period_value || null),
+    endMonth: end_date ? end_date.substring(0, 7) : (period_value || null),
+  });
+  const manualTotals = sumMonthly(targetMonthly);
+
   const targetMap = {};
-  targetSummary.forEach(t => { targetMap[t.service_name] = Number(t.total_target); });
+  allTargets.forEach(t => {
+    if (t.allocation_mode === 'manual') return;
+    targetMap[t.service_name] = (targetMap[t.service_name] || 0) + Number(t.target_amount);
+  });
+  for (const [svc, amt] of Object.entries(manualTotals)) {
+    if (manualNames.has(svc)) targetMap[svc] = amt;
+  }
 
   const [serviceData] = await pool.execute(
     `SELECT service_name, COALESCE(SUM(total_revenue), 0) as actual_amount FROM partner_revenue ${filter} GROUP BY service_name`, params
