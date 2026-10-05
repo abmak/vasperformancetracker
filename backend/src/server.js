@@ -1,7 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 require('./env');
+
+// Node cluster bootstrap. In production the primary process forks one worker per
+// CPU core — under pm2 fork/instances=1 both cores were otherwise idle — and
+// only the workers build the Express app below. In development this returns
+// false and everything runs in a single process as before. See ./cluster.js.
+const { bootstrapCluster, workerLabel } = require('./cluster');
+if (bootstrapCluster()) return;
 
 const serviceRoutes = require('./routes/services');
 const targetRoutes = require('./routes/targets');
@@ -32,7 +40,18 @@ const channelImportRoutes = require('./routes/channelImports');
 const { authenticate } = require('./middleware/permissions');
 
 const app = express();
-const PORT = 5000;
+
+// Which process answered — makes load spreading across cluster workers visible
+// in responses and while debugging (label only, no secrets).
+app.use((req, res, next) => {
+  res.setHeader('X-Worker', workerLabel());
+  next();
+});
+
+// Port comes from the environment (.env.production carries PORT=5001 in
+// production, where 5000 is taken by the public TLS terminator); plain 5000
+// remains the default for local development.
+const PORT = Number(process.env.PORT) || 5000;
 
 // Middleware
 app.use(cors());
@@ -45,6 +64,20 @@ app.use('/api/auth', authRoutes);
 // Health check — no token required
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ACME HTTP-01 challenge answers (Let's Encrypt). The TLS certificate for the
+// public IP is short-lived (~6 days) and is renewed by an external machine
+// that has internet access — this VPS has none. That machine drops the
+// challenge file into ../acme-challenges (relative to the backend dir) and
+// Let's Encrypt fetches http://196.189.155.179/.well-known/acme-challenge/<token>.
+// nginx forwards exactly this path here on port 80; no auth, no secrets.
+app.get('/.well-known/acme-challenge/:token', (req, res) => {
+  const file = path.join(__dirname, '..', 'acme-challenges', path.basename(req.params.token));
+  fs.readFile(file, 'utf8', (err, body) => {
+    if (err) return res.status(404).send('not found');
+    res.type('text/plain').send(body);
+  });
 });
 
 // Chat media files are loaded by <img>/<audio>/<a> tags, which cannot send the
@@ -107,8 +140,8 @@ app.use((err, req, res, next) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 VAS Revenue Backend running on port ${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`🚀 VAS Revenue Backend running on port ${PORT} [${workerLabel()}]`);
   
   // Pre-warm caches on startup so first user requests are instant
   setTimeout(async () => {
@@ -117,6 +150,12 @@ app.listen(PORT, () => {
       const { warmPartnerCount } = require('./utils/partnerCountCache');
       await warmPartnerCount();
     } catch {}
+
+    // Endpoint pre-warm runs in one worker only. Its self-requests are
+    // round-robined across every worker anyway, and letting each worker warm
+    // separately would repeat the same expensive report queries at boot on a
+    // small box; the others fill their caches as real traffic reaches them.
+    if (process.env.VAS_CLUSTER_WORKER && process.env.NODE_APP_INSTANCE !== '0') return;
     
     const jwt = require('jsonwebtoken');
     const http = require('http');
@@ -158,6 +197,15 @@ app.listen(PORT, () => {
     warmPromises.push(warmUrl(`/api/alerts?start_date=${fiscalStart}-06-01&end_date=${fiscalStart + 1}-05-31`));
     Promise.all(warmPromises).then(() => console.log('✅ All caches warmed')).catch(() => {});
   }, 200);
+});
+
+// Stop accepting, let in-flight responses finish, then exit. The cluster primary
+// signals workers with SIGTERM on restart, and pm2 only waits ~1.6s before it
+// goes for SIGKILL — so the deadline here stays well inside that window.
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+  if (server.closeIdleConnections) server.closeIdleConnections();
+  setTimeout(() => process.exit(0), 1000).unref();
 });
 
 module.exports = app;

@@ -40,57 +40,57 @@ router.post('/preview', requirePermission('import.upload'), upload.single('file'
 
     // Get all services for matching
     const [allServices] = await pool.execute('SELECT id, name, code FROM vas_services');
+    // Lookup maps: exact code match first, then exact name, then whole-word
+    // fragments of the name. Matching a sheet to a service must anchor on the
+    // VAS **service code** — codes are stable, names get renamed, and a rename
+    // must not silently re-route sheets to the wrong service.
     const serviceMap = {};
-    const serviceList = allServices.map(s => s.name);
+    const serviceList = allServices.map(s => `${s.name} (${s.code || 'no code'})`);
     for (const s of allServices) {
-      serviceMap[s.name.toLowerCase()] = s;
-      serviceMap[s.code.toLowerCase()] = s;
-      const parts = s.name.toLowerCase().split(/\s+/);
-      for (const p of parts) {
-        if (p.length > 2 && !serviceMap[p]) serviceMap[p] = s;
-      }
+      if (s.code) serviceMap[s.code.toLowerCase().trim()] = s;
+      if (s.name) serviceMap[s.name.toLowerCase().trim()] = s;
     }
 
-    // Fuzzy match sheet name to VAS service
+    // Fuzzy match sheet name to VAS service — code first, then name.
+    // A sheet that cannot be matched to a code or a current service name is
+    // left UNMATCHED on purpose: guessing would post revenue under the wrong
+    // service, and an unmatched sheet is visible and fixable instead.
     function matchSheetToService(sheetName) {
       const sLower = sheetName.toLowerCase().trim();
-      // Remove common prefixes/suffixes
       const cleaned = sLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-      // Exact match
+      // 1) Exact match on code or name
       if (serviceMap[cleaned]) return serviceMap[cleaned];
-      // Remove trailing underscores, spaces
       const trimmed = cleaned.replace(/[_\s]+$/, '');
       if (serviceMap[trimmed]) return serviceMap[trimmed];
-      // Try each service name against the sheet name
-      for (const svc of allServices) {
-        const svcLower = svc.name.toLowerCase();
-        // Sheet contains service name or vice versa
-        if (cleaned.includes(svcLower) || svcLower.includes(cleaned)) return svc;
-        // Check each word of service name against sheet name words
-        const svcWords = svcLower.split(/\s+/).filter(w => w.length > 2);
-        const sheetWords = cleaned.split(/\s+/).filter(w => w.length > 2);
-        const matchCount = svcWords.filter(sw => sheetWords.some(shw => shw.includes(sw) || sw.includes(shw))).length;
-        if (matchCount >= Math.ceil(svcWords.length * 0.6) && matchCount > 0) return svc;
-        // Check key terms: 'crbt' = Call Ring Tone, 'mt' = Mobile Terminating, 'api' = API, 'sms' = SMS, 'voice' = Voice
-        const keyTerms = {
-          'crbt': 'Calll Ring Tone', 'ring tone': 'Calll Ring Tone', 'call ring': 'Calll Ring Tone', 'partner': 'Calll Ring Tone',
-          'sms mt': 'Mobile Terminating', 'premium sms mt': 'Mobile Terminating', 'mt ': 'Mobile Terminating',
-          'sms-mo': 'Mobile Orginating', 'sms mo': 'Mobile Orginating', 'sms_mo': 'Mobile Orginating',
-          'api with ma': 'Applciation Protocol Interface', 'api-mega': 'Applciation Protocol Interface', 'api- call': 'Applciation Protocol Interface', 'api call': 'Applciation Protocol Interface', 'call signature': 'Applciation Protocol Interface', 'mega promo': 'Applciation Protocol Interface',
-          'voice premium': 'Voice Premium', 'voice_premium': 'Voice Premium',
-          'national lottery': 'National Lottery', 'lottery': 'National Lottery',
-          'ivr': 'Interactive Voice Response', 'voice response': 'Interactive Voice Response',
-          'csa': 'Applciation Protocol Interface',
-          'air time': 'Air time credit service', 'airtime': 'Air time credit service', 'credit service': 'Air time credit service',
-          'ip pbx': 'IP PBX', 'pbx': 'IP PBX',
-          'etz cloud': 'ETZ Cloud', 'cloud': 'ETZ Cloud',
-        };
-        for (const [term, svcName] of Object.entries(keyTerms)) {
-          if (cleaned.includes(term)) {
-            const matched = allServices.find(s => s.name === svcName);
-            if (matched) return matched;
-          }
+
+      // 2) A whole word in the sheet name equals (or contains) a service CODE.
+      //    Codes are short and unambiguous — e.g. sheet "API (with MA)" or
+      //    "API-MEGA" carries the code "API"; "Premium SMS MT" carries "MT".
+      const sheetWords = cleaned.split(' ');
+      for (const w of sheetWords) {
+        for (const [key, svc] of Object.entries(serviceMap)) {
+          // Only treat the key as a CODE if it is one; name fragments are
+          // handled later and must not win over real code matches.
+          const codeOwner = allServices.find(s => s.code && s.code.toLowerCase().trim() === key);
+          if (!codeOwner) continue;
+          if (w === key || (key.length >= 3 && w.includes(key))) return svc;
         }
+      }
+
+      // 3) Sheet name contains the full service name or vice versa
+      for (const svc of allServices) {
+        const svcLower = (svc.name || '').toLowerCase().trim();
+        if (svcLower && svcLower.length > 2 && (cleaned.includes(svcLower) || svcLower.includes(cleaned))) return svc;
+      }
+
+      // 4) Word-overlap fallback between sheet and service name (≥60% of the
+      //    service's meaningful words must appear). This maps "National
+      //    Lottery Jul" to "National Lottery" style cases without codes.
+      for (const svc of allServices) {
+        const svcWords = (svc.name || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        if (!svcWords.length) continue;
+        const matchCount = svcWords.filter(sw => sheetWords.some(shw => shw.includes(sw) || sw.includes(shw))).length;
+        if (matchCount >= Math.ceil(svcWords.length * 0.6)) return svc;
       }
       return null;
     }

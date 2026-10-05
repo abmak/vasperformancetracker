@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VAS Performance Tracking — Code Architecture</title>
+<style>
+  :root { --g:#15803d; --g2:#052e16; --ink:#0f172a; --mut:#5b6b7b; --line:#dbe7de; --bg:#f6fbf7; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.55 "Segoe UI", system-ui, -apple-system, sans-serif; }
+  header { background:linear-gradient(120deg,#052e16,#14532d 55%,#166534); color:#ecfdf5;
+           padding:28px 36px 22px; }
+  header h1 { margin:0 0 4px; font-size:24px; letter-spacing:.2px; }
+  header p { margin:0; color:#a7f3d0; font-size:13.5px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:20px 36px 70px; }
+  nav.toc { position:sticky; top:0; z-index:5; background:rgba(246,251,247,.95); backdrop-filter:blur(4px);
+            border-bottom:1px solid var(--line); padding:10px 0; display:flex; flex-wrap:wrap; gap:8px; }
+  nav.toc a { color:var(--g); font-size:13px; font-weight:600; text-decoration:none;
+              padding:4px 10px; border:1px solid var(--line); border-radius:999px; background:#fff; }
+  nav.toc a:hover { background:#ecfdf5; }
+  section { margin-top:34px; }
+  h2 { font-size:19px; margin:0 0 4px; color:var(--g2); display:flex; align-items:center; gap:10px; }
+  h2 .n { background:var(--g); color:#fff; width:26px; height:26px; border-radius:8px;
+          display:inline-flex; align-items:center; justify-content:center; font-size:13px; }
+  .sub { color:var(--mut); font-size:13.5px; margin:0 0 12px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px 20px;
+          box-shadow:0 1px 2px rgba(5,46,22,.05); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:900px){ .grid2 { grid-template-columns:1fr; } .wrap{padding:16px 16px 60px;} header{padding:22px 18px;} }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid #eef4ef; vertical-align:top; }
+  th { color:var(--g2); font-size:12px; text-transform:uppercase; letter-spacing:.4px; }
+  code { background:#ecfdf5; border:1px solid #d1fae5; border-radius:5px; padding:1px 5px;
+         font:12px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace; color:#065f46; }
+  .mermaid { background:#fff; }
+  .pill { display:inline-block; font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px;
+          background:#dcfce7; color:#166534; border:1px solid #bbf7d0; margin-right:6px; }
+  .warn { font-size:12.5px; color:#92400e; background:#fffbeb; border:1px solid #fde68a;
+          border-radius:8px; padding:8px 10px; margin-top:10px; }
+  footer { margin-top:50px; color:var(--mut); font-size:12.5px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>VAS Performance Tracking — Code Architecture</h1>
+  <p>Express + MySQL backend · React 19 + Vite + Tailwind v4 frontend · one process on :5000 · VPS 196.189.155.179 (pm2: perf-tracking-api)</p>
+</header>
+
+<div class="wrap">
+<nav class="toc">
+  <a href="#s1">1 · System topology</a>
+  <a href="#s2">2 · Repo layout</a>
+  <a href="#s3">3 · Backend</a>
+  <a href="#s4">4 · Frontend</a>
+  <a href="#s5">5 · Routing &amp; guards</a>
+  <a href="#s6">6 · Login + captcha flow</a>
+  <a href="#s7">7 · Data model</a>
+  <a href="#s8">8 · Build &amp; run</a>
+</nav>
+
+<section id="s1">
+  <h2><span class="n">1</span> System &amp; deployment topology</h2>
+  <p class="sub">One Node process serves the API and the built SPA; Nginx on the VPS hosts other sites only.</p>
+  <div class="card"><pre class="mermaid">
+flowchart LR
+    subgraph CLIENT["Browser (SPA)"]
+        UI["React 19 SPA<br/>frontend/dist"]
+    end
+    subgraph VPS["VPS 196.189.155.179"]
+        SRV["pm2 'perf-tracking-api'<br/>backend/src/server.js<br/>Express :5000"]
+        DIST["frontend/dist (static)"]
+        UP["backend/uploads/chat"]
+        DB[("MySQL")]
+        PMA["phpMyAdmin 127.0.0.1:8081<br/>(tunnel only)"]
+        CRON["cron mysqldump 02:15"]
+    end
+    GEM["Google Gemini API"]
+    ET["eTrade TIN verify"]
+    UI -- "GET / + /api/* (same origin)" --> SRV
+    SRV --> DIST
+    SRV --> UP
+    SRV -- SQL --> DB
+    PMA --> DB
+    CRON --> DB
+    SRV -.-> GEM
+    SRV -.-> ET
+  </pre></div>
+  <div class="warn"><span class="pill">Key</span> SPA calls <code>/api</code> relatively, so Express also serves <code>frontend/dist</code> and falls back to <code>index.html</code> for deep links. No ORM — raw SQL through one shared <code>mysql2</code> pool.</div>
+</section>
+
+<section id="s2">
+  <h2><span class="n">2</span> Repository layout</h2>
+  <div class="grid2">
+    <div class="card">
+      <b>backend/</b>
+      <table>
+        <tr><td><code>src/server.js</code></td><td>Entry: middleware, 26 route mounts, SPA fallback, error handler, cache pre-warm</td></tr>
+        <tr><td><code>src/env.js</code></td><td>Loads .env</td></tr>
+        <tr><td><code>src/config/</code></td><td><code>database.js</code> (pool) + idempotent DB setup/migration scripts (<code>npm run db:*</code>)</td></tr>
+        <tr><td><code>src/middleware/</code></td><td><code>permissions.js</code> (LIVE auth) · <code>auth.js</code> (legacy, unmounted)</td></tr>
+        <tr><td><code>src/routes/</code></td><td>26 route modules — handlers + SQL live here (no controllers/models)</td></tr>
+        <tr><td><code>src/utils/</code></td><td>puzzleCaptcha · rolePermissions · sectionMembership · caches · targetCalculator</td></tr>
+        <tr><td><code>uploads/chat/</code></td><td>chat media, served publicly (unguessable names)</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <b>frontend/</b>
+      <table>
+        <tr><td><code>src/main.jsx</code></td><td>React root</td></tr>
+        <tr><td><code>src/App.jsx</code></td><td>Router + guards (ProtectedRoute, SuperAdminScope, SectionGuard, PublicRoute)</td></tr>
+        <tr><td><code>src/context/</code></td><td>AuthContext (session + request helper) · DateFilterContext</td></tr>
+        <tr><td><code>src/pages/</code></td><td>28 screens (VAS, Channel, admin, collaboration)</td></tr>
+        <tr><td><code>src/components/</code></td><td>Layout (shell) · PuzzleCaptcha · ColumnPicker · channel/*</td></tr>
+        <tr><td><code>src/services/api.js</code></td><td>request() + typed API client per backend namespace</td></tr>
+        <tr><td><code>vite.config.js</code></td><td>dev :3001, proxies /api → :5000 · build → dist</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="warn"><span class="pill">Note</span> <code>controllers/</code> and <code>models/</code> exist but are empty placeholders — all business logic is in route modules.</div>
+</section>
+
+<section id="s3">
+  <h2><span class="n">3</span> Backend architecture</h2>
+  <p class="sub">Every protected namespace is mounted with <code>authenticate</code>; fine-grained checks inside route files.</p>
+  <div class="card"><pre class="mermaid">
+flowchart TB
+    REQ["HTTP request :5000"] --> MW["cors · json 10mb · urlencoded"]
+    MW --> PUB{"Public?<br/>/api/auth · /api/health · /api/chat/media"}
+    PUB -- yes --> R
+    PUB -- no --> AUTH["authenticate<br/>JWT verify → DB user (active) →<br/>effective role from JWT role_id+section →<br/>rolePermissions() → req.user"]
+    AUTH --> RP["requirePermission / requireAllPermissions<br/>(per endpoint)"]
+    RP --> R["Route handler routes/*.js<br/>raw SQL"]
+    R --> U["utils: puzzleCaptcha · rolePermissions ·<br/>endpointCache · partnerCountCache ·<br/>partnerMerge · targetCalculator · sectionMembership"]
+    U --> DB[("MySQL")]
+    R --> ERR["central error handler<br/>4xx pass-through · 5xx logged"]
+  </pre></div>
+  <div class="card" style="margin-top:14px">
+    <table>
+      <tr><th>Namespace</th><th>Module</th><th>Responsibility</th></tr>
+      <tr><td><code>/api/auth</code></td><td>auth.js</td><td>captcha, login, me, change/forgot/reset password, avatar, swap-section</td></tr>
+      <tr><td><code>/api/services · categories · targets · revenue · imports · partners</code></td><td>same-named files</td><td>VAS catalog, targets + allocations, revenue CRUD, Excel imports, partner datasets</td></tr>
+      <tr><td><code>/api/dashboard · reports · exports</code></td><td>same-named files</td><td>KPIs, trends, PPTX/PDF generation (pptxgenjs, pdfkit)</td></tr>
+      <tr><td><code>/api/actions · action-tasks · goal-cascade · alerts · alert-feedback · notifications</code></td><td>same-named files</td><td>execution tracking &amp; alerting</td></tr>
+      <tr><td><code>/api/roles · permissions · users · audit</code></td><td>same-named files</td><td>RBAC admin + audit trail</td></tr>
+      <tr><td><code>/api/chat · sms</code></td><td>chat.js · sms.js</td><td>DMs/groups/media · SMS log &amp; send</td></tr>
+      <tr><td><code>/api/ai</code></td><td>ai.js</td><td>Gemini assistant, quotas, usage tracking</td></tr>
+      <tr><td><code>/api/channel · /api/channel/imports</code></td><td>channel.js · channelImports.js</td><td>Indirect Channel: entities, TIN verify (eTrade), photos, imports, reports</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="n">4</span> Frontend architecture</h2>
+  <div class="card"><pre class="mermaid">
+flowchart TB
+    MAIN["main.jsx"] --> APP["App.jsx + BrowserRouter + Toaster"]
+    APP --> DFP["DateFilterProvider"]
+    APP --> AFP["AuthProvider"]
+    APP --> GU["Guards: ProtectedRoute · SuperAdminScope · SectionGuard · PublicRoute"]
+    GU --> L["Layout.jsx shell (sidebar, topbar, section switcher)"]
+    GU --> PAGES["28 pages: VAS · Channel · Admin · Chat/Messages · AI"]
+    PAGES --> API["services/api.js — request() + typed *API clients"]
+    PAGES --> CH["recharts visualizations"]
+    AUTHX["Login.jsx"] --> PCAP["PuzzleCaptcha.jsx (slider, challenge.width param)"]
+    API -- "fetch /api + Bearer token" --> BE["Express backend"]
+    AFP --> API
+  </pre></div>
+  <div class="warn"><span class="pill">Data flow</span> Pages → typed <code>*API</code> objects → single <code>request()</code> helper attaching <code>Bearer</code> from <code>localStorage.vas_token</code>. Dev: Vite :3001 proxies <code>/api</code> → :5000, identical code in prod where Express serves <code>dist/</code>.</div>
+</section>
+
+<section id="s5">
+  <h2><span class="n">5</span> Routing &amp; guards</h2>
+  <div class="card"><pre class="mermaid">
+flowchart LR
+    PUB["Public: / · /login · /forgot-password · /reset-password"] -- "logged in → section dashboard" --> PROT
+    subgraph PROT["ProtectedRoute → SuperAdminScope → Layout"]
+        ADM["/admin/users · /roles · /audit (master admin pinned)"]
+        VAS["/dashboard · /targets · /revenue · /import · /reports · /partners · /actions · /goals · /alerts"]
+        CHN["/channel · /channel/import-batch · /channel/import-single · /channel/reports"]
+        COL["/users · /messages · /chat · /ai · /ai-usage"]
+    end
+    PROT -- "no user / pending section choice" --> PUB
+  </pre></div>
+</section>
+
+<section id="s6">
+  <h2><span class="n">6</span> Security — login + slider captcha (live)</h2>
+  <div class="card"><pre class="mermaid">
+sequenceDiagram
+    participant B as Login.jsx + PuzzleCaptcha.jsx
+    participant A as /api/auth
+    participant C as utils/puzzleCaptcha.js
+    participant D as MySQL
+    B->>A: GET /api/auth/captcha
+    A->>C: issueChallenge()
+    Note over C: id = ts.pieceX.hmac · TTL 3 min<br/>single-use · 30/min/IP · 240×160 canvas
+    C-->>B: {id, bg, piece, piece_y, width, height, piece_size}
+    B->>A: POST /login {email, password, captcha_id, captcha_x}
+    A->>C: verifyChallenge(id, x)
+    alt fail (wrong / expired / replayed / tampered)
+        A-->>B: 400 captcha_failed → new puzzle (captchaKey++)
+    else within ±8px tolerance
+        A->>D: user by email · bcrypt · active check
+        A->>D: role scope + role_section_access / user_sections
+        alt multi-section user
+            A-->>B: sections[] → SectionChooser → POST /auth/swap-section
+        else
+            A-->>B: JWT {id, role_id, section, role_name}
+        end
+        B->>B: token → localStorage → dashboard
+    end
+  </pre></div>
+  <div class="warn"><span class="pill">Layers</span> Captcha gate before DB/bcrypt · JWT Bearer everywhere · per-request permission re-resolution · audit_trail on sensitive actions · section confinement in UI (SectionGuard) and API (sectionScope).</div>
+</section>
+
+<section id="s7">
+  <h2><span class="n">7</span> Data model (MySQL)</h2>
+  <p class="sub">Schema defined in config/dbSetup.js (VAS), config/channelDbSetup.js (Channel) + ensureTable() self-healing in routes.</p>
+  <div class="card"><pre class="mermaid">
+erDiagram
+    users ||--o{ user_sections : "per-section roles"
+    users }o--|| roles : "default role"
+    roles ||--o{ role_permissions : ""
+    permissions ||--o{ role_permissions : ""
+    roles ||--o{ role_section_access : "swappable sections"
+    users ||--o{ audit_trail : ""
+    users ||--o{ chat_messages : ""
+    users ||--o{ notifications : ""
+    vas_services ||--o{ revenue_targets : ""
+    revenue_targets ||--o{ revenue_target_allocations : ""
+    partner_revenue }o--|| import_batches : ""
+    vas_services ||--o{ action_notes : ""
+    action_notes ||--o{ action_tasks : ""
+    action_notes ||--o{ action_history : ""
+    action_notes ||--o{ action_replies : ""
+    goal_cascades ||--o{ goal_cascade_items : ""
+    channel_domains ||--o{ channel_categories : ""
+    channel_categories ||--o{ channel_entities : ""
+    channel_entities ||--o{ channel_stock_balances : ""
+    channel_import_batches ||--o{ channel_import_rows : ""
+    channel_import_batches ||--o{ channel_import_errors : ""
+    chat_groups ||--o{ chat_group_members : ""
+    chat_groups ||--o{ chat_messages : ""
+  </pre></div>
+  <div class="card" style="margin-top:14px">
+    <b>Domain groups</b>
+    <table>
+      <tr><th>Domain</th><th>Tables</th></tr>
+      <tr><td>RBAC</td><td><code>users · roles(scope) · permissions · role_permissions · user_sections · role_section_access · audit_trail</code></td></tr>
+      <tr><td>VAS revenue</td><td><code>vas_services · vas_service_types · vas_categories · revenue_targets · revenue_target_allocations · partner_revenue · service_revenue_summary · import_batches · kpi_snapshots</code></td></tr>
+      <tr><td>Execution</td><td><code>action_notes · action_history · action_replies · action_tasks · goal_cascades · goal_cascade_items · alert_feedback</code></td></tr>
+      <tr><td>Comms</td><td><code>chat_messages · chat_groups · chat_group_members · sms_messages · notifications</code></td></tr>
+      <tr><td>Indirect Channel</td><td><code>channel_entities · channel_domains · channel_categories · channel_category_aliases · channel_geo_aliases · channel_stock_balances · channel_stock_summary · channel_import_batches · channel_import_rows · channel_import_errors · channel_manager_photos(TIN)</code></td></tr>
+      <tr><td>AI</td><td><code>ai_usage · ai_chat_history</code></td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="n">8</span> Build &amp; run</h2>
+  <div class="card">
+    <table>
+      <tr><th>Concern</th><th>Value</th></tr>
+      <tr><td>Backend dev</td><td><code>npm run dev</code> (nodemon) — :5000</td></tr>
+      <tr><td>Frontend dev</td><td>Vite :3001, <code>/api</code> proxied to :5000</td></tr>
+      <tr><td>Build</td><td><code>npx vite build</code> → <code>frontend/dist</code>, served by Express when present</td></tr>
+      <tr><td>Production</td><td>pm2 <code>perf-tracking-api</code> → <code>backend/src/server.js</code> PORT 5000 on VPS</td></tr>
+      <tr><td>DB setup</td><td><code>npm run db:setup · db:admin-perms · db:chat-perms · db:channel-edit-perms · db:multi-section-scope</code></td></tr>
+      <tr><td>Health</td><td><code>GET /api/health</code> → <code>{status:'ok'}</code></td></tr>
+      <tr><td>Tests</td><td>none in repo; backend syntax-checked with <code>node --check</code></td></tr>
+      <tr><td>External calls</td><td>Google Gemini (ai.js, optional undici proxy) · eTrade TIN verify (channel.js)</td></tr>
+    </table>
+  </div>
+</section>
+
+<footer>Generated from the actual codebase (server.js mounts, route modules, config schema files, App.jsx guards) · scripts/ARCHITECTURE.md holds the same content in Mermaid-ready Markdown.</footer>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'base', securityLevel: 'loose',
+    themeVariables: { primaryColor: '#dcfce7', primaryBorderColor: '#15803d', primaryTextColor: '#052e16',
+      lineColor: '#4b7355', secondaryColor: '#f0fdf4', tertiaryColor: '#f8fafc', fontSize: '14px' },
+    flowchart: { curve: 'basis', padding: 10 }, sequence: { width: 180 } });
+</script>
+</body>
+</html>

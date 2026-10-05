@@ -10,6 +10,12 @@ pnpm-debug.log*
 .env.*
 !.env.example
 
+# SSH keys for database tunnel handover — NEVER commit these
+scripts/pma-handover/
+
+# One-shot ops launchers that may embed credentials — NEVER commit these
+.cap-run-redirect.sh
+
 # ─── Build output ────────────────────────────────────────────────────────────
 frontend/dist/
 frontend/dist-ssr/

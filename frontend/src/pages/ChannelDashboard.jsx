@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { channelAPI } from '../services/api';
-import { EditEntityModal, DeleteEntityModal } from '../components/channel/EntityModals';
-import ManagerPhoto from '../components/channel/ManagerPhoto';
+import RetailerMaps from '../components/channel/RetailerMaps';
 import ColumnPicker, { loadColumnPrefs } from '../components/ColumnPicker';
 import {
   Tooltip, LabelList, Legend, ResponsiveContainer, PieChart, Pie, Cell,
@@ -10,67 +9,28 @@ import {
   XAxis, YAxis, CartesianGrid,
 } from 'recharts';
 import {
-  Building2, Users, TrendingUp, TrendingDown, AlertTriangle,
+  Building2, Users, TrendingUp,
   MapPin, Search, ChevronLeft, ChevronRight, RefreshCw,
-  Globe, Layers, ArrowUpRight, ArrowDownRight, Minus,
-  Download, Filter, Loader2, Store, X, CornerDownRight,
-  Hash, Activity, PieChart as PieChartIcon, BarChart3,
-  Edit3, Trash2, Camera,
+  Globe, Layers, ArrowUpRight,
+  Filter, Loader2, Store, X, CornerDownRight,
+  Activity, PieChart as PieChartIcon, BarChart3,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { ImportStamp, IdentifierTag, STATUS_COLORS, groupDownstream } from '../components/channel/EntityBits';
 
 const fmtNum = (n) => (n || 0).toLocaleString();
 
 const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
 
-const STATUS_COLORS = {
-  active: 'bg-emerald-100 text-emerald-700 border-emerald-200',
-  canceled: 'bg-red-100 text-red-700 border-red-200',
-  inactive: 'bg-gray-100 text-gray-700 border-gray-200',
-};
-
-/**
- * The import a record came from: its short id and the moment the file landed.
- *
- * Every import gets one unique id (IMP-YYYYMMDD-NN) which is stamped on each
- * user it writes, so a row can always be traced back to the run that brought it
- * in — and deleting that run removes exactly those users.
- */
-function ImportStamp({ code, at }) {
-  if (!code) return <span className="text-xs text-gray-300">registered by hand</span>;
-  return (
-    <span title={at ? `Imported ${at}` : undefined}>
-      <span className="block font-mono text-xs font-medium text-blue-700">{code}</span>
-      {at && <span className="block text-[10px] text-gray-400">{at}</span>}
-    </span>
-  );
-}
-
 export default function ChannelDashboard() {
-  const { user, hasAnyPermission } = useAuth();
-  // Editing and deleting registered records is a grant, not a given: a role
-  // needs channel_entities.edit / channel_entities.delete (the master admin
-  // holds every permission, so the buttons simply appear for them).
-  const canEditEntity = hasAnyPermission('channel_entities.edit');
-  const canDeleteEntity = hasAnyPermission('channel_entities.delete');
+  const { hasAnyPermission } = useAuth();
   const [kpis, setKpis] = useState(null);
-  const [entities, setEntities] = useState(null);
   const [trend, setTrend] = useState(null);
   const [geo, setGeo] = useState(null);
   const [meta, setMeta] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedPeriod, setSelectedPeriod] = useState('');
-  const [entitySearch, setEntitySearch] = useState('');
-  const [entityPage, setEntityPage] = useState(1);
-  const [entityDomain, setEntityDomain] = useState('');
-  const [entityCategory, setEntityCategory] = useState('');
-  const [entityGeo, setEntityGeo] = useState('');
   const [activeTab, setActiveTab] = useState('overview');
-  const [selectedEntity, setSelectedEntity] = useState(null);
-  // Edit / Delete from the Entity Registry: the row feeds the shared modals
-  // (same ones the Reports tables use), and a save or delete reloads the list.
-  const [editingEntity, setEditingEntity] = useState(null);
-  const [deletingEntity, setDeletingEntity] = useState(null);
 
   // Hierarchy drill-down: which level is on screen and which node we descended
   // through to get here. `path` doubles as the breadcrumb.
@@ -104,10 +64,6 @@ export default function ChannelDashboard() {
 
   useEffect(() => { loadDashboard(selectedPeriod || undefined); }, [selectedPeriod]);
 
-  useEffect(() => {
-    if (activeTab === 'registry') loadEntities();
-  }, [activeTab, entitySearch, entityPage, entityDomain, entityCategory, entityGeo]);
-
   // The hierarchy walks one level at a time, straight from the registry.
   useEffect(() => {
     if (activeTab !== 'hierarchy') return undefined;
@@ -129,53 +85,10 @@ export default function ChannelDashboard() {
 
   useEffect(() => { setHierPage(1); }, [hierCtx, selectedPeriod, hierSearch]);
 
-  async function loadEntities() {
-    try {
-      const params = { page: entityPage, limit: 25 };
-      if (entitySearch) params.search = entitySearch;
-      if (entityDomain) params.domain = entityDomain;
-      if (entityCategory) params.category = entityCategory;
-      if (entityGeo) params.geo = entityGeo;
-      if (selectedPeriod) params.period = selectedPeriod;
-      const data = await channelAPI.getEntities(params);
-      setEntities(data);
-    } catch (err) {
-      toast.error('Failed to load entities');
-    }
-  }
-
   async function handleEntityClick(id) {
     try {
-      const data = await channelAPI.getEntity(id);
-      setSelectedEntity(data);
-    } catch (e) { /* ignore */ }
-  }
-
-  function refreshRegistry() {
-    loadEntities();
-    channelAPI.getKPIs().then(setKpis).catch(() => {});
-  }
-
-  // The registry list carries only the table's columns, but the edit form needs
-  // every field (trade name, woreda, sub-city, notes...) — and the delete
-  // warning needs the downstream count. Pull the full record first, so a save
-  // can never quietly blank the fields the list view does not show.
-  async function openEditEntity(row) {
-    try {
-      const data = await channelAPI.getEntity(row.id);
-      setEditingEntity(data.entity);
-    } catch (e) {
-      toast.error('Could not load the record for editing');
-    }
-  }
-
-  async function openDeleteEntity(row) {
-    try {
-      const data = await channelAPI.getEntity(row.id);
-      setDeletingEntity({ ...row, ...data.entity, direct_children: (data.children || []).length });
-    } catch (e) {
-      setDeletingEntity(row);
-    }
+      return await channelAPI.getEntity(id);
+    } catch (e) { return null; }
   }
 
   const periods = meta?.periods || [];
@@ -254,7 +167,7 @@ export default function ChannelDashboard() {
             <Filter size={16} className="text-gray-400" />
             <select
               value={selectedPeriod}
-              onChange={(e) => { setSelectedPeriod(e.target.value); setEntityPage(1); }}
+              onChange={(e) => { setSelectedPeriod(e.target.value); }}
               className="text-sm border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
               <option value="">Latest Period</option>
@@ -293,10 +206,9 @@ export default function ChannelDashboard() {
 
       {/* Tabs */}
       <div className="flex gap-1 bg-white/70 backdrop-blur p-1 rounded-xl border border-gray-200 shadow-sm w-fit">
-        {[
-          { key: 'overview', label: 'Overview' },
+        {[          { key: 'overview', label: 'Overview' },
           { key: 'hierarchy', label: 'Hierarchy' },
-          { key: 'registry', label: 'Entity Registry' },
+          { key: 'maps', label: 'Maps' },
         ].map(tab => (
           <button key={tab.key} onClick={() => setActiveTab(tab.key)}
             className={'px-4 py-2 text-sm font-medium rounded-lg transition ' + (activeTab === tab.key ? 'bg-gradient-to-r from-emerald-500 to-green-600 text-white shadow-sm' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100')}>
@@ -473,35 +385,10 @@ export default function ChannelDashboard() {
         />
       )}
 
-      {/* Registry Tab */}
-      {activeTab === 'registry' && (
-        <RegistryView
-          entities={entities} entitySearch={entitySearch} setEntitySearch={setEntitySearch}
-          entityPage={entityPage} setEntityPage={setEntityPage}
-          entityDomain={entityDomain} setEntityDomain={setEntityDomain}
-          entityCategory={entityCategory} setEntityCategory={setEntityCategory}
-          entityGeo={entityGeo} setEntityGeo={setEntityGeo}
-          meta={meta} onEntityClick={handleEntityClick}
-          onEditEntity={canEditEntity ? openEditEntity : undefined}
-          onDeleteEntity={canDeleteEntity ? openDeleteEntity : undefined}
-          selectedEntity={selectedEntity} onCloseEntity={() => setSelectedEntity(null)}
-        />
+      {/* Maps Tab */}
+      {activeTab === 'maps' && (
+        <RetailerMaps areas={geo?.areas || []} />
       )}
-
-      {/* Shared edit / delete modals — the same ones the Reports tables use.
-          They live at the page level because their state does. */}
-      <EditEntityModal
-        isOpen={Boolean(editingEntity)}
-        entity={editingEntity}
-        onClose={() => setEditingEntity(null)}
-        onUpdated={refreshRegistry}
-      />
-      <DeleteEntityModal
-        isOpen={Boolean(deletingEntity)}
-        entity={deletingEntity}
-        onClose={() => setDeletingEntity(null)}
-        onDeleted={refreshRegistry}
-      />
     </div>
   );
 }
@@ -787,29 +674,6 @@ function HierarchyView({ ctx, setCtx, report, loading, page, setPage, search, se
 }
 
 /** The whole profile of one registry row, plus what sits under it. */
-/**
- * Downstream children grouped the way the channel thinks: Distributors first,
- * then Sub-Distributors, then Retailers. Every list that renders children —
- * the hierarchy card and the registry detail modal — goes through this so the
- * ordering and headings can never drift apart.
- */
-const DOWNSTREAM_GROUPS = [
-  { level: 1, label: 'Distributors' },
-  { level: 2, label: 'Sub-Distributors' },
-  { level: 3, label: 'Retailers' },
-];
-
-function groupDownstream(children) {
-  const buckets = { 1: [], 2: [], 3: [] };
-  (children || []).forEach((c) => {
-    const l = Number(c.level);
-    if (buckets[l]) buckets[l].push(c);
-  });
-  return DOWNSTREAM_GROUPS
-    .filter((g) => buckets[g.level].length > 0)
-    .map((g) => ({ ...g, items: buckets[g.level] }));
-}
-
 function EntityDetailCard({ data, onClose }) {
   const e = data.entity || {};
   const children = data.children || [];
@@ -914,25 +778,6 @@ function EntityDetailCard({ data, onClose }) {
   );
 }
 
-/**
- * The identifier code an operator quotes — IDC-R-0001.
- *
- * Every Distributor, Sub-Distributor and Retailer is given one on import, so it
- * is the stable way to refer to a record that does not depend on its row id.
- */
-function IdentifierTag({ code }) {
-  if (!code) return <span className="text-xs text-gray-300">—</span>;
-  return (
-    <span
-      className="inline-flex items-center gap-1 font-mono font-semibold text-[11px] px-1.5 py-0.5 rounded-md border border-indigo-100 bg-indigo-50 text-indigo-700"
-      title="Identifier Code"
-    >
-      <Hash size={10} className="text-indigo-400" />
-      {code}
-    </span>
-  );
-}
-
 /** The quiet placeholder a chart shows instead of an empty axis frame. */
 function ChartEmpty({ label }) {
   return (
@@ -967,328 +812,3 @@ function KPICard({ label, value, icon, color, sub }) {
   );
 }
 
-function RegistryView({ entities, entitySearch, setEntitySearch, entityPage, setEntityPage, entityDomain, setEntityDomain, entityCategory, setEntityCategory, entityGeo, setEntityGeo, meta, onEntityClick, onEditEntity, onDeleteEntity, selectedEntity, onCloseEntity }) {
-  const canEdit = Boolean(onEditEntity);
-  const canDelete = Boolean(onDeleteEntity);
-  const canModify = canEdit || canDelete;
-  // Areas are ranked by how many channel users sit in them, so the busiest
-  // places surface first in the filter.
-  const geoChoices = (meta?.geo_values || []).map(g => g.value).filter(Boolean);
-
-  // Column preferences — same picker as the reports tables.
-  const colDefs = useMemo(() => [
-    { key: 'name', label: 'Name', always: true },
-    { key: 'identifier', label: 'Identifier Code' },
-    { key: 'mobile', label: 'Mobile' },
-    { key: 'category', label: 'Category' },
-    { key: 'domain', label: 'Domain' },
-    { key: 'status', label: 'Status' },
-    { key: 'area', label: 'Area' },
-    { key: 'parent', label: 'Sub-Distributor' },
-    { key: 'owner', label: 'Distributor' },
-    { key: 'imported', label: 'Imported by' },
-    ...(canModify ? [{ key: 'actions', label: 'Actions', always: true }] : []),
-  ], [canModify]);
-  const allColKeys = useMemo(() => colDefs.map((c) => c.key), [colDefs]);
-  const storageKey = 'channel_cols_registry';
-  const [visibleCols, setVisibleCols] = useState(() => loadColumnPrefs(storageKey, allColKeys));
-  useEffect(() => {
-    setVisibleCols(loadColumnPrefs(storageKey, allColKeys));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storageKey, allColKeys.join(',')]);
-  const show = (k) => visibleCols.has(k);
-
-  return (
-    <div className="space-y-4">
-      <div className="bg-white rounded-xl border border-gray-200 p-4">
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="flex-1 relative">
-            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-            <input type="text" value={entitySearch}
-              onChange={(e) => { setEntitySearch(e.target.value); setEntityPage(1); }}
-              placeholder="Search by name, mobile, sub-distributor, distributor..."
-              className="w-full pl-9 pr-4 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none" />
-          </div>
-          <select value={entityDomain} onChange={(e) => { setEntityDomain(e.target.value); setEntityPage(1); }} className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
-            <option value="">All Domains</option>
-            {meta?.domains?.map(d => <option key={d.code} value={d.code}>{d.name}</option>)}
-          </select>
-          <select value={entityCategory} onChange={(e) => { setEntityCategory(e.target.value); setEntityPage(1); }} className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
-            <option value="">All Categories</option>
-            {meta?.categories?.filter(c => c.level >= 1 && c.level <= 3 && c.domain_code === 'IDC').map(c => <option key={c.code} value={c.code}>{c.name}</option>)}
-          </select>
-          <select value={entityGeo} onChange={(e) => { setEntityGeo(e.target.value); setEntityPage(1); }} className="border border-gray-300 rounded-lg px-3 py-2 text-sm max-w-[220px]">
-            <option value="">All Areas</option>
-            {geoChoices.map(g => <option key={g} value={g}>{g}</option>)}
-          </select>
-          {(entitySearch || entityDomain || entityCategory || entityGeo) && (
-            <button
-              onClick={() => { setEntitySearch(''); setEntityDomain(''); setEntityCategory(''); setEntityGeo(''); setEntityPage(1); }}
-              className="px-3 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 transition"
-            >
-              Clear
-            </button>
-          )}
-          <div className="sm:ml-auto">
-            <ColumnPicker
-              columns={colDefs}
-              visible={visibleCols}
-              setVisible={setVisibleCols}
-              storageKey={storageKey}
-            />
-          </div>
-        </div>
-      </div>
-
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-          <p className="text-sm font-semibold text-gray-800">
-            Channel Entities {entities ? '(' + (entities.pagination?.total || 0) + ')' : ''}
-          </p>
-          {entities?.period && <p className="text-xs text-gray-500">Period: {entities.period?.slice(0, 7)}</p>}
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-gray-50 border-b border-gray-200">
-                <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Name</th>
-                {show('identifier') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Identifier Code</th>}
-                {show('mobile') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Mobile</th>}
-                {show('category') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Category</th>}
-                {show('domain') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Domain</th>}
-                {show('status') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Status</th>}
-                {show('area') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Area</th>}
-                {show('parent') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Sub-Distributor</th>}
-                {show('owner') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>}
-                {show('imported') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Imported by</th>}
-                {canModify && show('actions') && (
-                  <th className="px-4 py-3 text-center text-xs font-semibold text-gray-600">Actions</th>
-                )}
-              </tr>
-            </thead>
-            <tbody>
-              {(entities?.entities || []).map(e => (
-                <tr key={e.id} className="border-b border-gray-50 hover:bg-blue-50/30 cursor-pointer transition" onClick={() => onEntityClick(e.id)}>
-                  <td className="px-4 py-3 font-medium text-gray-800 max-w-[220px]" title={e.user_name}>
-                    <div className="flex items-center gap-2 min-w-0">
-                      {e.has_photo && (
-                        <ManagerPhoto
-                          tin={e.tin}
-                          alt={e.user_name}
-                          className="w-7 h-7 rounded-full object-cover border border-emerald-300 shrink-0"
-                        />
-                      )}
-                      <span className="truncate">{e.user_name}</span>
-                    </div>
-                  </td>
-                  {show('identifier') && <td className="px-4 py-3"><IdentifierTag code={e.identifier_code} /></td>}
-                  {show('mobile') && <td className="px-4 py-3 text-gray-600 font-mono text-xs">{e.mobile_number}</td>}
-                  {show('category') && <td className="px-4 py-3 text-gray-600">{e.category_label}</td>}
-                  {show('domain') && <td className="px-4 py-3 text-gray-600">{e.domain_name}</td>}
-                  {show('status') && (
-                    <td className="px-4 py-3">
-                      <span className={'inline-block px-2 py-0.5 text-xs font-medium rounded-full border ' + (STATUS_COLORS[e.status] || STATUS_COLORS.active)}>
-                        {e.status}
-                      </span>
-                    </td>
-                  )}
-                  {show('area') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[140px] truncate" title={e.geo_domain_raw || ''}>{e.geo_domain_raw || '--'}</td>}
-                  {show('parent') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.parent_name || ''}>{e.parent_name || '--'}</td>}
-                  {show('owner') && <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate" title={e.owner_name || ''}>{e.owner_name || '--'}</td>}
-                  {show('imported') && (
-                    <td className="px-4 py-3 whitespace-nowrap">
-                      <ImportStamp code={e.import_code} at={e.imported_at} />
-                    </td>
-                  )}
-                  {canModify && show('actions') && (
-                    <td className="px-4 py-3 whitespace-nowrap" onClick={(ev) => ev.stopPropagation()}>
-                      <div className="flex items-center justify-center gap-1">
-                        {canEdit && (
-                          <button
-                            onClick={() => onEditEntity(e)}
-                            className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition"
-                            title={`Edit ${e.user_name}`}
-                          >
-                            <Edit3 size={15} />
-                          </button>
-                        )}
-                        {canDelete && (
-                          <button
-                            onClick={() => onDeleteEntity(e)}
-                            className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
-                            title={`Delete ${e.user_name}`}
-                          >
-                            <Trash2 size={15} />
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  )}
-                </tr>
-              ))}
-              {(!entities?.entities || entities.entities.length === 0) && (
-                <tr><td colSpan={colDefs.filter(c => show(c.key)).length} className="px-4 py-12 text-center text-gray-400">No channel users found</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-        {entities?.pagination && entities.pagination.pages > 1 && (
-          <div className="px-5 py-3 border-t border-gray-100 flex items-center justify-between">
-            <p className="text-xs text-gray-500">Page {entities.pagination.page} of {entities.pagination.pages}</p>
-            <div className="flex gap-2">
-              <button onClick={() => setEntityPage(p => Math.max(1, p - 1))} disabled={entityPage <= 1}
-                className="px-3 py-1 border border-gray-300 rounded text-xs disabled:opacity-40 hover:bg-gray-50">
-                <ChevronLeft size={14} />
-              </button>
-              <button onClick={() => setEntityPage(p => Math.min(entities.pagination.pages, p + 1))} disabled={entityPage >= entities.pagination.pages}
-                className="px-3 py-1 border border-gray-300 rounded text-xs disabled:opacity-40 hover:bg-gray-50">
-                <ChevronRight size={14} />
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {selectedEntity && <EntityDetailModal entity={selectedEntity} onClose={onCloseEntity} />}
-    </div>
-  );
-}
-
-function EntityDetailModal({ entity, onClose }) {
-  const { entity: e, children = [] } = entity;
-  const [photoMeta, setPhotoMeta] = useState(null);
-  // Sub-Distributors can serve several Distributors — the registry files them
-  // under one, but their retailers' owners tell the whole story.
-  const distributors = entity.distributors || [];
-
-  // The manager photo lives against the record's TIN, fetched from eTrade's
-  // Registration API during TIN verification. Look up who it shows while the
-  // modal is open so the card can name the manager.
-  useEffect(() => {
-    setPhotoMeta(null);
-    if (!e?.tin) return undefined;
-    let cancelled = false;
-    channelAPI.getPhotoMeta(e.tin)
-      .then((meta) => { if (!cancelled && meta?.found) setPhotoMeta(meta); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [e?.id, e?.tin]);
-
-  // Upline links shown the way the channel thinks: a retailer's Sub-
-  // Distributor row names its parent; a sub-distributor's row IS the parent,
-  // so its parent slot shows its Distributor instead — no duplicate label
-  // carrying the same name on both rows.
-  const uplineRows = Number(e.level) === 3
-    ? [
-      ['Sub-Distributor', e.parent_name ? (e.parent_mobile ? `${e.parent_name} · ${e.parent_mobile}` : e.parent_name) : '--'],
-      ['Distributor', e.owner_name ? (e.owner_mobile ? `${e.owner_name} · ${e.owner_mobile}` : e.owner_name) : '--'],
-    ]
-    : Number(e.level) === 2
-      ? [
-        ['Distributor', e.owner_name ? (e.owner_mobile ? `${e.owner_name} · ${e.owner_mobile}` : e.owner_name) : '--'],
-      ]
-      : [];
-  const infoGrid = [
-    ['Status', e.status], ['Product', e.product],
-    ...uplineRows,
-    ['Geo', e.geo_domain_raw || '--'], ['Source', e.source || '--'],
-    // Retailers no longer carry a reporting window on their detail view.
-    ...(Number(e.level) === 3 ? [] : [
-      ['First Seen', e.first_seen_period], ['Last Seen', e.last_seen_period],
-    ]),
-    ['Import ID', e.import_code || 'registered by hand'],
-    ['Imported On', e.imported_at || '--'],
-    ['Import File', e.import_filename || '--'],
-    ['First Import', e.first_import_code || '--'],
-  ];
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[85vh] overflow-y-auto">
-        <div className="flex items-center justify-between p-5 border-b border-gray-100">
-          <div>
-            <h2 className="text-lg font-bold text-gray-900">{e.user_name}</h2>
-            <p className="text-sm text-gray-500 flex items-center gap-2 flex-wrap">
-              <span>{e.mobile_number} · {e.category_label} · {e.domain_name}</span>
-              <IdentifierTag code={e.identifier_code} />
-            </p>
-          </div>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-lg text-gray-400 hover:text-gray-600">X</button>
-        </div>
-        <div className="p-5 space-y-5">
-          {/* Company manager photo — attached to the record's TIN from the
-              eTrade registration record during TIN verification. */}
-          {e.tin && (
-            <div className="bg-gradient-to-r from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl p-3.5 flex items-center gap-3.5">
-              <ManagerPhoto
-                tin={e.tin}
-                alt={e.user_name}
-                className="w-16 h-16 rounded-xl object-cover border-2 border-emerald-400 shrink-0"
-              />
-              <div className="min-w-0">
-                <p className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider flex items-center gap-1">
-                  <Camera size={11} className="text-emerald-700" />
-                  Company Manager Photo
-                </p>
-                <p className="text-sm font-bold text-gray-900 mt-0.5 truncate">
-                  {photoMeta?.manager_name_eng || photoMeta?.manager_name || e.user_name}
-                </p>
-                <p className="text-[11px] text-gray-500 font-mono">
-                  TIN {e.tin}
-                  {photoMeta?.source === 'upload' ? ' · custom upload' : photoMeta ? ' · eTrade / MoR' : ''}
-                </p>
-              </div>
-            </div>
-          )}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            {infoGrid.map(([label, val]) => (
-              <div key={label}>
-                <p className="text-xs text-gray-500">{label}</p>
-                <p className="text-sm font-medium text-gray-800">{val || '--'}</p>
-              </div>
-            ))}
-          </div>
-          {Number(e.level) === 2 && distributors.length > 1 && (
-            <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3">
-              <p className="text-[10px] font-bold text-indigo-800 uppercase tracking-wider mb-1.5">
-                Works with {distributors.length} Distributors
-              </p>
-              <div className="space-y-1">
-                {distributors.map((d) => (
-                  <div key={d.id} className="flex items-center gap-2 text-xs">
-                    <span className="font-medium text-gray-800 truncate flex-1" title={d.user_name}>{d.user_name}</span>
-                    <span className="text-gray-500 font-mono">{d.mobile_number}</span>
-                    <span className="text-[10px] text-indigo-500 whitespace-nowrap">{d.retailers} retailer{d.retailers === 1 ? '' : 's'}</span>
-                    {d.is_filed && <span className="text-[10px] px-1 rounded bg-white text-indigo-600 border border-indigo-200">filed</span>}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          {children.length > 0 && (
-            <div>
-              <h4 className="text-sm font-semibold text-gray-800 mb-2">Downstream Users ({children.length})</h4>
-              <div className="bg-gray-50 rounded-lg p-3 max-h-48 overflow-y-auto">
-                {groupDownstream(children).map((grp) => (
-                  <div key={grp.level} className="mb-2 last:mb-0">
-                    <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
-                      {grp.label} ({grp.items.length})
-                    </p>
-                    {grp.items.map(c => (
-                      <div key={c.id} className="flex items-center justify-between py-1 border-b border-gray-100 last:border-0">
-                        <div>
-                          <span className="text-xs font-medium text-gray-800">{c.user_name}</span>
-                          <span className="text-[10px] text-gray-500 ml-2">{c.mobile_number}</span>
-                        </div>
-                        <span className={'text-[10px] px-1.5 py-0.5 rounded ' + (STATUS_COLORS[c.status] || '')}>{c.status}</span>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}

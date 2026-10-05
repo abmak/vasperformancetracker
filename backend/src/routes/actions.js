@@ -322,6 +322,7 @@ router.post('/:id/transition', async (req, res) => {
             : `The action "${action.title}" was marked complete by ${actorName}`,
           action_id: req.params.id,
           link: '/actions',
+          section: (req.user && req.user.section) || 'VAS',
         });
       }
     }
@@ -431,6 +432,7 @@ router.post('/:id/replies', async (req, res) => {
         message: `${userName} replied on "${actionTitle}": "${String(message).trim().slice(0, 120)}"`,
         action_id: req.params.id,
         link: '/actions',
+        section: (req.user && req.user.section) || 'VAS',
       });
     }
 

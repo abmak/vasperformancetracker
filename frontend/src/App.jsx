@@ -14,6 +14,7 @@ import Revenue from './pages/Revenue';
 import Import from './pages/Import';
 import Reports from './pages/Reports';
 import ChannelDashboard from './pages/ChannelDashboard';
+import ChannelRegistry from './pages/ChannelRegistry';
 import ChannelBatchImport from './pages/ChannelBatchImport';
 import ChannelSingleImport from './pages/ChannelSingleImport';
 import ChannelReports from './pages/ChannelReports';
@@ -122,6 +123,7 @@ export default function App() {
             <Route path="/admin/users" element={<SuperAdminUsers />} />
             <Route path="/dashboard" element={<SectionGuard><Dashboard /></SectionGuard>} />
             <Route path="/channel" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelDashboard /></SectionGuard>} />
+            <Route path="/channel/registry" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelRegistry /></SectionGuard>} />
             <Route path="/channel/import-batch" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelBatchImport /></SectionGuard>} />
             <Route path="/channel/import-single" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelSingleImport /></SectionGuard>} />
             <Route path="/channel/reports" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelReports /></SectionGuard>} />

@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ManagerPhoto from '../components/channel/ManagerPhoto';
+import { LocationCapture } from '../components/channel/LocationCapture';
 import { fileToBase64 } from '../utils/helpers';
 
 /**
@@ -220,6 +221,31 @@ export default function ChannelSingleImport() {
   const [photoUploading, setPhotoUploading] = useState(false);
   const [photoTimestamp, setPhotoTimestamp] = useState(Date.now());
   const photoInputRef = useRef(null);
+  // GPS position captured for a retailer, kept outside `form` so the
+  // structured payload goes to the API verbatim.
+  const [gps, setGps] = useState(null);
+
+  // A resolved GPS position fills two columns, both fill-if-empty so nothing
+  // the operator typed (or an earlier source provided) is ever clobbered:
+  //   Location / Address  ← the composed "street, city, country" string
+  //   Geographical Domain ← the resolved city
+  // Removing the GPS pin never deletes what was written — it is the form's
+  // text now. Functional updates read the previous state, so a fast capture
+  // right after an edit cannot work from stale field values.
+  function handleGps(next) {
+    setGps(next);
+    if (next?.address) {
+      setForm((prev) => ({
+        ...prev,
+        location: prev.location.trim()
+          ? prev.location
+          : (next.address.composed || '').slice(0, 255),
+        geo_domain_raw: prev.geo_domain_raw.trim()
+          ? prev.geo_domain_raw
+          : (next.address.city || ''),
+      }));
+    }
+  }
 
   async function handlePhotoUpload(e) {
     const file = e.target.files?.[0];
@@ -276,11 +302,14 @@ export default function ChannelSingleImport() {
             if (m.startsWith('0')) m = m.slice(1);
             if (!next.mobile_number) next.mobile_number = m;
           }
-          // Use PARISH_NAME for Retailer Geographical Domain as requested
-          if (res.parish_name || res.geo_domain) {
+          // Parish → Geographical Domain, eTrade address → Location. Both are
+          // fill-if-empty: a Geographical Domain or address already derived
+          // from the operator's reverse-geocoded GPS position (or typed by
+          // hand) must never be replaced by the registry's copy.
+          if ((res.parish_name || res.geo_domain) && !next.geo_domain_raw) {
             next.geo_domain_raw = res.parish_name || res.geo_domain;
           }
-          if (res.location) next.location = res.location;
+          if (res.location && !next.location) next.location = res.location;
           next.tin = res.tin || raw;
           next.woreda = res.woreda || '';
           next.sub_city = res.sub_city || '';
@@ -393,10 +422,31 @@ export default function ChannelSingleImport() {
         ...form,
         category_code: category.code,
         user_name: form.user_name.trim().replace(/\s+/g, ' '),
+        // The TIN was verified against eTrade in this session (tinData is set
+        // only after a found verdict, and cleared the moment the TIN field is
+        // edited), so the new record is born verified. The backend accepts
+        // only true — a payload can never stamp a not-verified verdict.
+        ...(tinData ? { tin_verified: true } : {}),
+        ...(level === 3 && gps ? {
+          latitude: gps.latitude,
+          longitude: gps.longitude,
+          location_accuracy: gps.accuracy,
+          ...(gps.address ? {
+            addr_country: gps.address.country,
+            addr_city: gps.address.city,
+            addr_street: gps.address.street,
+          } : {}),
+        } : {}),
       });
       setResult({ ...data, level });
       toast.success(`${spec.name} registered`);
       setForm({ ...emptyForm });
+      setGps(null);
+      // The verified-TIN session belongs to this submission only — the next
+      // registration must verify its own TIN, or it would inherit this
+      // record's verified badge without ever being checked.
+      handleClearTinData();
+      setPhotoTimestamp(Date.now());
       // A new Sub-Distributor or Distributor should be selectable immediately.
       loadUplines();
     } catch (err) {
@@ -833,7 +883,7 @@ export default function ChannelSingleImport() {
 
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Retailer Location / Address
+                      Retailer Street Address Information
                     </label>
                     <input
                       type="text"
@@ -843,6 +893,10 @@ export default function ChannelSingleImport() {
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     />
                     <p className="text-[11px] text-gray-400 mt-1">Sub-City, Woreda, Kebele, Landmark or House No.</p>
+                  </div>
+
+                  <div className="md:col-span-2">
+                    <LocationCapture value={gps} onChange={handleGps} />
                   </div>
                 </div>
                 )}
@@ -938,7 +992,7 @@ export default function ChannelSingleImport() {
           </button>
           <button
             type="button"
-            onClick={() => { setForm({ ...emptyForm }); setResult(null); }}
+            onClick={() => { setForm({ ...emptyForm }); setGps(null); setResult(null); }}
             className="px-4 py-2.5 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200 transition"
           >
             Clear

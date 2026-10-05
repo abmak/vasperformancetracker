@@ -53,6 +53,14 @@ const vasNavItems = [
 
 const channelNavItems = [
   { to: '/channel', icon: LayoutDashboard, label: 'Channel Dashboard', permission: 'channel_dashboard.view' },
+  // The registry is its own grant: any of the six channel_entities permissions
+  // (view / edit / delete, each also in an *_own strength) opens it. What the
+  // visitor sees inside is narrowed by which ones they hold.
+  { to: '/channel/registry', icon: ClipboardList, label: 'Entity Registry', anyPermission: [
+    'channel_entities.view', 'channel_entities.view_own',
+    'channel_entities.edit', 'channel_entities.edit_own',
+    'channel_entities.delete', 'channel_entities.delete_own',
+  ] },
   { to: '/channel/import-batch', icon: Upload, label: 'Batch Import', permission: 'channel_import.batch' },
   { to: '/channel/import-single', icon: Users, label: 'Single Registration', permission: 'channel_import.single' },
   { to: '/channel/reports', icon: FileBarChart, label: 'Channel Reports', permission: 'channel_reports.view' },
@@ -80,7 +88,7 @@ export default function Layout() {
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [notifUnread, setNotifUnread] = useState(0);
-  const { user, isMasterAdmin, logout, hasPermission, updateUser, changePassword, uploadAvatar, removeAvatar, swapSection } = useAuth();
+  const  { user, isMasterAdmin, logout, hasPermission, hasAnyPermission, updateUser, changePassword, uploadAvatar, removeAvatar, swapSection } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const isChatPage = location.pathname === '/chat';
@@ -148,11 +156,13 @@ export default function Layout() {
     return () => clearInterval(interval);
   }, [user?.id]);
 
-  // Poll notifications every 20 seconds + on open
+  // Poll notifications every 20 seconds + on open.
+  // Scoped to the section the user is currently in so the bell never shows
+  // another section's notifications; reloads when the section is swapped.
   async function loadNotifications() {
     if (!user?.id) return;
     try {
-      const data = await notificationsAPI.getAll(user.id);
+      const data = await notificationsAPI.getAll(user.id, user.section);
       setNotifications(data.notifications || []);
       setNotifUnread(data.unread || 0);
     } catch (err) { /* ignore */ }
@@ -162,7 +172,7 @@ export default function Layout() {
     loadNotifications();
     const interval = setInterval(loadNotifications, 20000);
     return () => clearInterval(interval);
-  }, [user?.id]);
+  }, [user?.id, user?.section]);
 
   async function handleOpenNotification(n) {
     setNotifOpen(false);
@@ -178,7 +188,7 @@ export default function Layout() {
 
   async function handleMarkAllRead() {
     try {
-      await notificationsAPI.markAllRead(user.id);
+      await notificationsAPI.markAllRead(user.id, user.section);
       setNotifUnread(0);
       setNotifications(list => list.map(x => ({ ...x, is_read: 1 })));
     } catch (err) { /* ignore */ }
@@ -236,7 +246,12 @@ export default function Layout() {
 
         {/* Navigation */}
         <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto">
-          {navItems.filter(item => !item.permission || hasPermission(item.permission)).map((item) => (
+          {navItems.filter(item =>
+            (!item.permission || hasPermission(item.permission)) &&
+            // anyPermission items open for the master admin and for any role
+            // holding at least one of the listed grants.
+            (!item.anyPermission || isMasterAdmin || item.anyPermission.some(p => hasPermission(p)))
+          ).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

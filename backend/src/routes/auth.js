@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { rolePermissions } = require('../utils/rolePermissions');
+const { issueChallenge, verifyChallenge, captchaRateLimit } = require('../utils/puzzleCaptcha');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'vas-revenue-tracker-secret-key-2026';
 const JWT_EXPIRY = '24h';
@@ -76,10 +77,26 @@ async function getAvailableSections({ section, role_scope: roleScope }, roleId) 
   return ALL_SECTIONS.filter(s => allowed.has(s));
 }
 
+// GET /api/auth/captcha — new slider-puzzle challenge (rate-limited per IP)
+router.get('/captcha', captchaRateLimit, (req, res) => {
+  res.json(issueChallenge());
+});
+
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, captcha_id, captcha_x } = req.body;
+
+    // Puzzle captcha must pass BEFORE anything else — this endpoint is the only
+    // way in, so it is the natural bottleneck for bots/credential stuffing.
+    const verdict = await verifyChallenge(captcha_id, captcha_x);
+    if (!verdict.ok) {
+      const hint = verdict.reason === 'expired'
+        ? 'Puzzle expired — try again'
+        : 'Puzzle verification failed — drag the piece into place and retry';
+      return res.status(400).json({ error: hint, captcha_failed: true, captcha_reason: verdict.reason });
+    }
+
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }

@@ -233,6 +233,37 @@ const ADDED_COLUMNS = [
   ['channel_entities', 'house_no', 'VARCHAR(100) NULL'],
   ['channel_entities', 'trade_name', 'VARCHAR(255) NULL'],
   ['channel_entities', 'photo_keywords', 'VARCHAR(255) NULL'],
+
+  // ── TIN verification flag ───────────────────────────────────────────────
+  // Stamped when the record's TIN is found on the eTrade / Ministry of
+  // Revenue register — by the single-entity verify, a batch verify run, or
+  // the importer's pre-verify — and cleared when the TIN changes or an
+  // explicit "set false" arrives. A record without a TIN stays null: no
+  // TIN, no verdict. NULL also means "never checked" for records that do
+  // carry one.
+  ['channel_entities', 'tin_verified', 'TINYINT(1) NULL DEFAULT NULL'],
+
+  // ── GPS coordinates captured at registration ─────────────────────────────
+  // The single-registration form asks the operator to share their device
+  // location when registering a retailer, so the shop's physical position is
+  // recorded alongside the free-text address. DECIMAL(10,7) spans ±999° with
+  // ~1cm precision — ample for both latitude and longitude.
+  ['channel_entities', 'latitude', 'DECIMAL(10,7) NULL'],
+  ['channel_entities', 'longitude', 'DECIMAL(10,7) NULL'],
+  // When the position was taken and how good it was (meters), so a stale or
+  // low-quality fix can be told apart from a fresh, accurate one.
+  ['channel_entities', 'location_captured_at', 'DATETIME NULL'],
+  ['channel_entities', 'location_accuracy_m', 'DECIMAL(8,2) NULL'],
+
+  // ── Reverse-geocoded address parts ───────────────────────────────────────
+  // The registration form resolves the captured position against Nominatim
+  // (OpenStreetMap) in the operator's browser and sends the structured parts
+  // along, so reports can group by country/city without parsing free text.
+  // The composed "street, city, country" string also fills the location
+  // column when the operator left it empty.
+  ['channel_entities', 'addr_country', 'VARCHAR(100) NULL'],
+  ['channel_entities', 'addr_city', 'VARCHAR(150) NULL'],
+  ['channel_entities', 'addr_street', 'VARCHAR(255) NULL'],
   ['channel_import_rows', 'tin', 'VARCHAR(50) NULL'],
   ['channel_import_rows', 'location', 'VARCHAR(255) NULL'],
   ['channel_import_rows', 'national_id', 'VARCHAR(50) NULL'],
@@ -469,6 +500,56 @@ async function ensureChannelSchema() {
     for (const [table, column, definition] of ADDED_COLUMNS) {
       await ensureColumn(table, column, definition);
     }
+
+    // Backfill the TIN verification flag once: a record whose manager photo
+    // was stored by the verify flow had its TIN confirmed against eTrade /
+    // MoR at that moment, so it starts as verified. Both sides normalize the
+    // TIN (digits only, zero-padded to 10) so legacy unpadded spellings
+    // match. Only null flags are touched — an explicit not-verified verdict
+    // is never overridden — and the query becomes a no-op once every TIN row
+    // has a verdict.
+    await pool.query(
+      `UPDATE channel_entities e
+         JOIN channel_manager_photos mp
+           ON mp.tin = LPAD(REPLACE(REPLACE(REPLACE(e.tin, ' ', ''), '-', ''), '+', ''), 10, '0')
+          SET e.tin_verified = 1
+        WHERE e.tin IS NOT NULL AND e.tin <> '' AND e.tin_verified IS NULL`
+    );
+
+    // ── Registry permission catalog ──────────────────────────────────────
+    // view / edit / delete each come in two strengths: the bare permission
+    // reaches every record; the *_own variant is confined to the records the
+    // caller's account recorded (channel_entities.created_by — the operator
+    // who ran the import or filled the registration form). Seeded here so a
+    // deploy lights them up in the role editor with no manual script.
+    const REGISTRY_PERMISSIONS = [
+      { name: 'channel_entities.view',       description: 'View all registered channel data (Entity Registry and reports)',        action: 'view' },
+      { name: 'channel_entities.view_own',   description: 'View only channel records recorded by own account',                     action: 'view_own' },
+      { name: 'channel_entities.edit',       description: 'Edit registered channel data (dashboard registry and reports)',         action: 'edit' },
+      { name: 'channel_entities.edit_own',   description: 'Edit only channel records recorded by own account',                     action: 'edit_own' },
+      { name: 'channel_entities.delete',     description: 'Delete registered channel data (dashboard registry and reports)',       action: 'delete' },
+      { name: 'channel_entities.delete_own', description: 'Delete only channel records recorded by own account',                   action: 'delete_own' },
+    ];
+    for (const p of REGISTRY_PERMISSIONS) {
+      const [ex] = await pool.query('SELECT id FROM permissions WHERE name = ?', [p.name]);
+      if (ex.length === 0) {
+        await pool.query(
+          'INSERT INTO permissions (name, description, module, action, section) VALUES (?, ?, ?, ?, ?)',
+          [p.name, p.description, 'channel_entities', p.action, 'INDIRECT_CHANNEL']
+        );
+      }
+    }
+
+    // GLOBAL-scope roles hold the master admin's every right, so the
+    // registry permissions land in their grants too — the interface reads
+    // the token's permission list, and without the grant it would hide the
+    // registry from the one account that must always see it.
+    await pool.query(
+      `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+       SELECT r.id, p.id FROM roles r JOIN permissions p
+         ON p.module = 'channel_entities' AND p.section = 'INDIRECT_CHANNEL'
+        WHERE r.scope = 'GLOBAL'`
+    );
 
     for (const [table, index, definition] of ADDED_INDEXES) {
       await ensureIndex(table, index, definition);

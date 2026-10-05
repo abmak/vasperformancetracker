@@ -1,0 +1,13 @@
+{
+  "name": "le-ip-renewer",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Renews the Let's Encrypt short-lived certificate for the VPS public IP (196.189.155.179) from this machine — the VPS itself has no outbound internet.",
+  "scripts": {
+    "renew": "node renew.js",
+    "renew:staging": "node renew.js --staging"
+  },
+  "dependencies": {
+    "acme-client": "^5.4.0"
+  }
+}

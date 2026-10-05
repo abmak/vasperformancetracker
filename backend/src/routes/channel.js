@@ -32,6 +32,31 @@ function requireChannelDataDelete(req, res, next) {
 }
 
 /**
+ * How far this caller's grant reaches over registered channel data.
+ *
+ * Each action (view / edit / delete) comes in two strengths: the bare
+ * permission covers every record; the *_own variant is confined to the
+ * records the caller's account recorded (channel_entities.created_by — the
+ * operator who ran the import or filled the registration form). The master
+ * admin's GLOBAL role reaches everything.
+ *
+ * Returns 'all', 'own', or null when the caller holds no grant at all.
+ */
+function channelDataScope(req, action) {
+  if (isMasterAdmin(req)) return 'all';
+  const names = req.user?.permissionNames || [];
+  if (names.includes(`channel_entities.${action}`)) return 'all';
+  if (names.includes(`channel_entities.${action}_own`)) return 'own';
+  return null;
+}
+
+/** True when the record was recorded by this caller's account. */
+function isOwnRecord(record, user) {
+  const by = record?.created_by;
+  return Boolean(by) && (by === user?.username || by === user?.email);
+}
+
+/**
  * Fetch data from eTrade API with timeout and HTTPS handling.
  *
  * DNS: the production VPS's systemd-resolved stub (127.0.0.53) intermittently
@@ -189,6 +214,16 @@ router.use(requireChannelAccess);
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 /** Trim a free-text field down to its column width, or null when empty. */
 const text = (v, max) => String(v === null || v === undefined ? '' : v).trim().slice(0, max) || null;
+/**
+ * Parse a decimal-degree coordinate from the browser's Geolocation API.
+ * Returns a number in [-limit, limit] or null when absent/invalid, so junk
+ * from a malformed payload can never reach a DECIMAL column.
+ */
+const coord = (v, limit) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || Math.abs(n) > limit || Math.abs(n) < 0.0001) return null;
+  return Math.round(n * 1e7) / 1e7;
+};
 const chunkArray = (arr, size) => {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -509,6 +544,29 @@ router.get('/dashboard/kpis', async (req, res) => {
       .filter((r) => Number(r.level) === wanted)
       .reduce((a, r) => a + Number(r.entities), 0);
 
+    // How many Sub-Distributors / Retailers actually sit *beneath* each level,
+    // counted from the same parent_id / owner_id links the entity list's
+    // Sub-Dists / Retailers columns use — so the summary agrees with the table.
+    // These are register totals (not period filtered), exactly like the list.
+    const [hierarchy] = await pool.query(
+      `SELECT
+         (SELECT COUNT(DISTINCT ch.id) FROM channel_entities ch
+            JOIN channel_categories cc ON cc.id = ch.category_id
+            JOIN channel_entities up ON up.id = COALESCE(ch.parent_id, ch.owner_id)
+            JOIN channel_categories uc ON uc.id = up.category_id
+           WHERE cc.level = 2 AND uc.level = 1 AND ch.id <> up.id) AS subs_under_distributors,
+         (SELECT COUNT(DISTINCT ch.id) FROM channel_entities ch
+            JOIN channel_categories cc ON cc.id = ch.category_id
+            JOIN channel_entities up ON up.id = ch.owner_id
+            JOIN channel_categories uc ON uc.id = up.category_id
+           WHERE cc.level = 3 AND uc.level = 1 AND ch.id <> up.id) AS retailers_under_distributors,
+         (SELECT COUNT(DISTINCT ch.id) FROM channel_entities ch
+            JOIN channel_categories cc ON cc.id = ch.category_id
+            JOIN channel_entities up ON up.id = ch.parent_id
+            JOIN channel_categories uc ON uc.id = up.category_id
+           WHERE cc.level = 3 AND uc.level = 2 AND ch.id <> up.id) AS retailers_under_sub_distributors`
+    );
+
     // A user's stock is held by their distributor, so the register holds far more
     // users than the balance table holds balances — report both.
     const entitiesWithBalance = Number(totals[0].entities_with_balance) || 0;
@@ -553,6 +611,10 @@ router.get('/dashboard/kpis', async (req, res) => {
       distributors: levelEntities(1),
       sub_distributors: levelEntities(2),
       retailers: levelEntities(3),
+      // Hierarchy roll-up — the "beneath" totals the Executive Summary shows.
+      subs_under_distributors: Number(hierarchy[0].subs_under_distributors) || 0,
+      retailers_under_distributors: Number(hierarchy[0].retailers_under_distributors) || 0,
+      retailers_under_sub_distributors: Number(hierarchy[0].retailers_under_sub_distributors) || 0,
     };
 
     // 2-minute TTL — short enough that stale data after a delete is visible only
@@ -880,7 +942,34 @@ router.get('/dashboard/geo', async (req, res) => {
   }
 });
 
-// ── GET /api/channel/reports/level ─────────────────────────────────────────
+// ── GET /api/channel/dashboard/gps-points ───────────────────────────────
+/**
+ * Every retailer with a captured GPS position, for the dashboard map views.
+ * Deliberately unpaged — the map plots the whole set, and a position-bearing
+ * retailer is one row. Hierarchy uplines (Distributors / Sub-Distributors)
+ * never carry coordinates, so the level-3 filter is what keeps this tight.
+ */
+router.get('/dashboard/gps-points', async (req, res) => {
+  try {
+    await ensureChannelSchema();
+    const [rows] = await pool.query(
+      `SELECT e.id, e.user_name, e.mobile_number, e.identifier_code,
+              e.geo_domain_raw, e.latitude, e.longitude, e.status,
+              e.addr_city, e.addr_country, e.location
+         FROM channel_entities e
+         JOIN channel_categories c ON c.id = e.category_id
+        WHERE c.level = 3 AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
+        ORDER BY e.user_name`
+    );
+    res.json({
+      points: rows.map((r) => ({ ...r, latitude: Number(r.latitude), longitude: Number(r.longitude) })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── GET /api/channel/reports/level ─────────────────────────────────────
 /**
  * One report per hierarchy level: Distributor (1), Sub-Distributor (2),
  * Retailer (3).
@@ -1320,6 +1409,17 @@ router.get('/entities', async (req, res) => {
 
     const where = [];
     const params = [];
+    // Viewing the register is a grant: view covers every record, view_own
+    // confines the list — and its count — to the records this account
+    // recorded. No grant at all, no registry.
+    const viewScope = channelDataScope(req, 'view');
+    if (!viewScope) {
+      return res.status(403).json({ error: 'You do not have permission to view the channel registry' });
+    }
+    if (viewScope === 'own') {
+      where.push('e.created_by IN (?, ?)');
+      params.push(req.user?.username || '', req.user?.email || '');
+    }
     if (search) {
       where.push('(e.user_name LIKE ? OR e.mobile_number LIKE ? OR e.parent_mobile LIKE ? OR e.owner_mobile LIKE ?)');
       const like = `%${search}%`;
@@ -1337,12 +1437,13 @@ router.get('/entities', async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT e.id, e.mobile_number, e.user_name, e.status, e.geo_domain_raw, e.product,
-              e.business_type, e.tin, e.location, e.national_id,
+              e.business_type, e.tin, e.tin_verified, e.location, e.national_id,
+              e.woreda, e.sub_city, e.house_no, e.trade_name, e.photo_keywords,
               e.parent_mobile, e.owner_mobile, e.parent_id, e.owner_id, e.source,
-              e.identifier_code, e.import_code,
+              e.identifier_code, e.import_code, e.created_by,
+              u.username AS created_by_name,
+              e.latitude, e.longitude,
               DATE_FORMAT(e.imported_at, '%Y-%m-%d %H:%i') AS imported_at,
-              DATE_FORMAT(e.first_seen_period, '%Y-%m-%d') AS first_seen_period,
-              DATE_FORMAT(e.last_seen_period, '%Y-%m-%d') AS last_seen_period,
               c.code AS category_code, c.name AS category_label, c.level,
               d.code AS domain_code, d.name AS domain_name,
               p.user_name AS parent_name, o.user_name AS owner_name,
@@ -1353,12 +1454,33 @@ router.get('/entities', async (req, res) => {
          JOIN channel_domains d ON d.id = c.domain_id
          LEFT JOIN channel_entities p ON p.id = e.parent_id
          LEFT JOIN channel_entities o ON o.id = e.owner_id
+         LEFT JOIN users u ON u.username = e.created_by
          ${balanceJoin.sql}
         WHERE ${whereSql}
         ORDER BY b.available_balance IS NULL, b.available_balance DESC, e.user_name
         LIMIT ? OFFSET ?`,
       [...balanceJoin.params, ...params, limit, offset]
     );
+
+    // Which of the page's records carry a manager photo — one Set lookup per
+    // page, normalized the same way storeManagerPhoto keys the photo table:
+    // digits only, zero-padded to 10.
+    const normTin = (t) => {
+      const d = String(t || '').replace(/\D/g, '');
+      return d.length >= 8 ? d.padStart(10, '0') : null;
+    };
+    const pageTins = [...new Set(rows.map((r) => normTin(r.tin)).filter(Boolean))];
+    if (pageTins.length) {
+      const [photoRows] = await pool.query(
+        `SELECT tin FROM channel_manager_photos WHERE tin IN (${pageTins.map(() => '?').join(',')})`,
+        pageTins
+      );
+      const photoTins = new Set(photoRows.map((r) => r.tin));
+      for (const r of rows) {
+        const t = normTin(r.tin);
+        r.has_photo = Boolean(t && photoTins.has(t));
+      }
+    }
 
     const [count] = await pool.query(
       `SELECT COUNT(*) AS total FROM channel_entities e
@@ -1506,6 +1628,15 @@ router.get('/entities/:id', async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'Channel entity not found' });
 
+    // view_own callers may only open the records their account recorded.
+    const viewScope = channelDataScope(req, 'view');
+    if (!viewScope) {
+      return res.status(403).json({ error: 'You do not have permission to view the channel registry' });
+    }
+    if (viewScope === 'own' && !isOwnRecord(rows[0], req.user)) {
+      return res.status(403).json({ error: 'This record was recorded by another account' });
+    }
+
     const [history] = await pool.query(
       "SELECT DATE_FORMAT(period_month, '%Y-%m-%d') AS period_month, product, available_balance, source FROM channel_stock_balances WHERE entity_id = ? ORDER BY period_month DESC, product",
       [req.params.id]
@@ -1651,6 +1782,18 @@ router.get('/tin-verify/:tin', async (req, res, next) => {
       }
     }
 
+    // A TIN the Ministry's register answers for is a verified TIN. The flag
+    // lands on every registry row carrying this TIN so the register's column
+    // reflects reality without waiting for a per-entity verify run. Legacy
+    // rows store the TIN unpadded (as typed), so both sides are normalized:
+    // digits only, zero-padded to the canonical 10.
+    await pool.query(
+      `UPDATE channel_entities
+          SET tin_verified = 1
+        WHERE LPAD(REPLACE(REPLACE(REPLACE(tin, ' ', ''), '-', ''), '+', ''), 10, '0') = ?`,
+      [tin]
+    );
+
     res.json(payload);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1785,8 +1928,9 @@ router.post('/entities/:id/verify-tin', async (req, res) => {
     }
 
     // The TIN itself always lands (that is the linkage being verified);
-    // everything else was governed by the consent list above.
-    await pool.query('UPDATE channel_entities SET tin = ? WHERE id = ?', [cleanTin, entity.id]);
+    // everything else was governed by the consent list above. Landing it
+    // stamps the verification flag — this row is now known-good.
+    await pool.query('UPDATE channel_entities SET tin = ?, tin_verified = 1 WHERE id = ?', [cleanTin, entity.id]);
 
     invalidate('/channel');
 
@@ -2010,8 +2154,9 @@ router.post('/tin-verify/batch', async (req, res) => {
           let officialMobile = (item.MOBILE_PHONE || item.PHONE_NO || '').trim();
           if (officialMobile.startsWith('251')) officialMobile = '0' + officialMobile.slice(3);
 
-          // Build the per-row update from the consent list.
-          const sets = ['tin = ?'];
+          // Build the per-row update from the consent list. Verified here
+          // means the TIN was found on the eTrade / MoR register.
+          const sets = ['tin = ?', 'tin_verified = 1'];
           const vals = [cleanTin];
           const applied = [];
           if (consent) {
@@ -2169,9 +2314,15 @@ router.post('/tin-verify/batch', async (req, res) => {
 
 // ── POST /api/channel/entities — single registration ───────────────────────
 
-router.post('/entities', requireChannelDataEdit, async (req, res) => {
+router.post('/entities', async (req, res) => {
   try {
     await ensureChannelSchema();
+    // Registering is creating data: create/edit_all reaches every level, and
+    // create/edit_own is confined to the rows this account recorded.
+    const createScope = channelDataScope(req, 'create') || channelDataScope(req, 'edit');
+    if (!createScope) {
+      return res.status(403).json({ error: 'You do not have permission to register channel data' });
+    }
     const b = req.body || {};
 
     const mobile = normalizeMobileForStore(b.mobile_number);
@@ -2226,17 +2377,44 @@ router.post('/entities', requireChannelDataEdit, async (req, res) => {
     const tradeName = text(b.trade_name, 255);
     const photoKeywords = text(b.photo_keywords || b.photo?.keywords, 255);
 
+    // GPS capture from the registration form (retailer flow). Optional — a
+    // registration without coordinates stays without them.
+    const latitude = coord(b.latitude, 90);
+    const longitude = coord(b.longitude, 180);
+    const locationCapturedAt = latitude && longitude ? new Date() : null;
+    const locAcc = Number(b.location_accuracy);
+    const locationAccuracy = latitude && longitude && Number.isFinite(locAcc) && locAcc >= 0
+      ? Math.min(Math.round(locAcc * 100) / 100, 99999999)
+      : null;
+
+    // Reverse-geocoded address parts from the registration form (Nominatim,
+    // resolved in the operator's browser). Optional — coordinates without a
+    // resolved address still register.
+    const addrCountry = text(b.addr_country, 100);
+    const addrCity = text(b.addr_city, 150);
+    const addrStreet = text(b.addr_street, 255);
+
+    // The Single Registration form verifies the TIN against eTrade before the
+    // record exists, so the verified verdict arrives with the payload. It is
+    // accepted as true only — a payload cannot inject a not-verified verdict
+    // over the record's own history.
+    const tinVerifiedFromForm = (b.tin_verified === true || b.tin_verified === 1) && tin ? 1 : null;
+
     const [result] = await pool.query(
       `INSERT INTO channel_entities
          (mobile_number, user_name, category_id, status, geo_domain_raw, product,
           business_type, parent_mobile, owner_mobile, parent_id, owner_id, source,
-          tin, location, national_id, woreda, sub_city, house_no, trade_name, photo_keywords,
+          tin, tin_verified, location, national_id, woreda, sub_city, house_no, trade_name, photo_keywords,
+          latitude, longitude, location_captured_at, location_accuracy_m,
+          addr_country, addr_city, addr_street,
           first_seen_period, last_seen_period, created_by, notes)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,now(),?,?,?,?,?,?,?,?)`,
       [
         mobile, userName, category.id, normalizeStatus(b.status), b.geo_domain_raw || null,
         b.product || 'eTopUP', b.business_type || null, parentMobile, ownerMobile, parentId, ownerId,
-        tin, location, nationalId, woreda, subCity, houseNo, tradeName, photoKeywords,
+        tin, tinVerifiedFromForm, location, nationalId, woreda, subCity, houseNo, tradeName, photoKeywords,
+        latitude, longitude, locationAccuracy,
+        addrCountry, addrCity, addrStreet,
         period, period, req.user?.username || req.user?.email || 'system', b.notes || null,
       ]
     );
@@ -2273,12 +2451,21 @@ router.post('/entities', requireChannelDataEdit, async (req, res) => {
 
 // ── PUT /api/channel/entities/:id ──────────────────────────────────────────
 
-router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
+router.put('/entities/:id', async (req, res) => {
   try {
     await ensureChannelSchema();
+    // edit reaches every record; edit_own is confined to the records this
+    // account recorded — someone else's entry is refused, not hidden.
+    const editScope = channelDataScope(req, 'edit');
+    if (!editScope) {
+      return res.status(403).json({ error: 'You do not have permission to edit channel data' });
+    }
     const b = req.body || {};
     const [existing] = await pool.query('SELECT * FROM channel_entities WHERE id = ?', [req.params.id]);
     if (!existing.length) return res.status(404).json({ error: 'Channel entity not found' });
+    if (editScope === 'own' && !isOwnRecord(existing[0], req.user)) {
+      return res.status(403).json({ error: 'This record was recorded by another account — you can only edit your own entries' });
+    }
     const current = existing[0];
 
     const category = b.category_code || b.category_id
@@ -2314,13 +2501,47 @@ router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
       }
     }
 
+    // GPS coordinates are written only when the payload carries them — an edit
+    // that does not touch the position must not wipe an existing fix.
+    let latitude = current.latitude;
+    let longitude = current.longitude;
+    let locationCapturedAt = current.location_captured_at;
+    let locationAccuracy = current.location_accuracy_m;
+    if (b.latitude !== undefined && b.longitude !== undefined) {
+      latitude = coord(b.latitude, 90);
+      longitude = coord(b.longitude, 180);
+      locationCapturedAt = latitude && longitude ? new Date() : null;
+      const acc = Number(b.location_accuracy);
+      locationAccuracy = latitude && longitude && Number.isFinite(acc) && acc >= 0
+        ? Math.min(Math.round(acc * 100) / 100, 99999999)
+        : null;
+    }
+
+    // Reverse-geocoded address parts — written only when the payload carries
+    // them, so an edit that leaves the address out never wipes it.
+    const addrCountry = b.addr_country !== undefined ? text(b.addr_country, 100) : current.addr_country;
+    const addrCity = b.addr_city !== undefined ? text(b.addr_city, 150) : current.addr_city;
+    const addrStreet = b.addr_street !== undefined ? text(b.addr_street, 255) : current.addr_street;
+
+    // A changed TIN is an unverified TIN: the flag belonged to the old number.
+    // The operator can also set it explicitly (tin_verified = true/false),
+    // which is how a correction made outside the verify flow gets recorded.
+    const rawTin = b.tin !== undefined ? text(b.tin, 50) : current.tin;
+    const nextTin = rawTin ? String(rawTin).trim().replace(/\D/g, '').padStart(10, '0') : null;
+    const tinChanged = (nextTin || null) !== (current.tin ? String(current.tin).trim().replace(/\D/g, '').padStart(10, '0') : null);
+    const tinVerified = b.tin_verified !== undefined
+      ? (b.tin_verified ? 1 : 0)
+      : (tinChanged ? (nextTin ? 0 : null) : current.tin_verified);
+
     await pool.query(
       `UPDATE channel_entities
           SET user_name = ?, category_id = ?, status = ?, geo_domain_raw = ?, product = ?,
               business_type = ?, parent_mobile = ?, owner_mobile = ?, parent_id = ?, owner_id = ?,
               mobile_number = ?,
-              tin = ?, location = ?, national_id = ?,
+              tin = ?, tin_verified = ?, location = ?, national_id = ?,
               woreda = ?, sub_city = ?, house_no = ?, trade_name = ?, photo_keywords = ?,
+              latitude = ?, longitude = ?, location_captured_at = ?, location_accuracy_m = ?,
+              addr_country = ?, addr_city = ?, addr_street = ?,
               notes = ?,
               source = IF(source = 'manual', 'manual', source)
         WHERE id = ?`,
@@ -2333,7 +2554,7 @@ router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
         b.business_type !== undefined ? b.business_type || null : current.business_type,
         parentMobile, ownerMobile, parentId, ownerId,
         newMobile,
-        b.tin !== undefined ? text(b.tin, 50) : current.tin,
+        nextTin, tinVerified,
         b.location !== undefined ? text(b.location, 255) : current.location,
         b.national_id !== undefined ? text(b.national_id, 50) : current.national_id,
         b.woreda !== undefined ? text(b.woreda, 150) : current.woreda,
@@ -2341,6 +2562,8 @@ router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
         b.house_no !== undefined ? text(b.house_no, 100) : current.house_no,
         b.trade_name !== undefined ? text(b.trade_name, 255) : current.trade_name,
         b.photo_keywords !== undefined ? text(b.photo_keywords, 255) : current.photo_keywords,
+        latitude, longitude, locationCapturedAt, locationAccuracy,
+        addrCountry, addrCity, addrStreet,
         b.notes !== undefined ? b.notes : current.notes,
         req.params.id,
       ]
@@ -2382,11 +2605,20 @@ router.put('/entities/:id', requireChannelDataEdit, async (req, res) => {
 
 // ── DELETE /api/channel/entities/:id ───────────────────────────────────────
 
-router.delete('/entities/:id', requireChannelDataDelete, async (req, res) => {
+router.delete('/entities/:id', async (req, res) => {
   try {
     await ensureChannelSchema();
+    // delete reaches every record; delete_own is confined to the records
+    // this account recorded.
+    const deleteScope = channelDataScope(req, 'delete');
+    if (!deleteScope) {
+      return res.status(403).json({ error: 'You do not have permission to delete channel data' });
+    }
     const [rows] = await pool.query('SELECT * FROM channel_entities WHERE id = ?', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Channel entity not found' });
+    if (deleteScope === 'own' && !isOwnRecord(rows[0], req.user)) {
+      return res.status(403).json({ error: 'This record was recorded by another account — you can only delete your own entries' });
+    }
 
     const [children] = await pool.query(
       'SELECT COUNT(*) AS c FROM channel_entities WHERE parent_id = ? OR owner_id = ?',

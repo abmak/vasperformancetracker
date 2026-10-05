@@ -329,11 +329,14 @@ export const chatAPI = {
 };
 
 // Notifications (action assignments, replies, …)
+// `section` scopes the bell to the section the user is currently in, so VAS work
+// never surfaces while viewing the Indirect Channel section and vice versa.
+// Omit it (null/undefined) to see every section (used by cross-section accounts).
 export const notificationsAPI = {
-  getAll: (userId) => request(`/notifications?user_id=${userId}`),
-  getUnreadCount: (userId) => request(`/notifications/unread-count?user_id=${userId}`),
+  getAll: (userId, section) => request(`/notifications?user_id=${userId}${section ? `&section=${section}` : ''}`),
+  getUnreadCount: (userId, section) => request(`/notifications/unread-count?user_id=${userId}${section ? `&section=${section}` : ''}`),
   markRead: (id, userId) => request(`/notifications/${id}/read`, { method: 'PATCH', body: { user_id: userId } }),
-  markAllRead: (userId) => request('/notifications/read-all', { method: 'POST', body: { user_id: userId } }),
+  markAllRead: (userId, section) => request('/notifications/read-all', { method: 'POST', body: { user_id: userId, section: section || null } }),
 };
 
 // AI Usage Report
@@ -376,6 +379,7 @@ export const channelAPI = {
     const qs = new URLSearchParams(params || {}).toString();
     return request(`/channel/dashboard/geo?${qs}`);
   },
+  getGpsPoints: () => request('/channel/dashboard/gps-points'),
   getEntities: (params) => {
     const qs = new URLSearchParams(params || {}).toString();
     return request(`/channel/entities?${qs}`);

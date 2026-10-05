@@ -96,6 +96,7 @@ router.post('/', async (req, res) => {
         message: `You have been assigned the task "${title}" on action "${actionTitle}"`,
         action_id,
         link: '/actions',
+        section: (req.user && req.user.section) || 'VAS',
       });
     }
 
@@ -210,6 +211,7 @@ router.patch('/:id/status', async (req, res) => {
         message: `${actorName} completed the task "${updated[0].title}"`,
         action_id: updated[0].action_id,
         link: '/actions',
+        section: (req.user && req.user.section) || 'VAS',
       });
     }
 

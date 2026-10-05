@@ -91,10 +91,15 @@ export function AuthProvider({ children }) {
     setLoading(false);
   }
 
-  async function login(email, password) {
+  async function login(email, password, captcha) {
     const data = await request('/auth/login', {
       method: 'POST',
-      body: { email, password },
+      body: {
+        email,
+        password,
+        captcha_id: captcha?.captcha_id,
+        captcha_x: captcha?.captcha_x,
+      },
     });
     setToken(data.token);
     setUser(data.user);

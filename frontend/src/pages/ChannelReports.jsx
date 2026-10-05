@@ -46,6 +46,14 @@ const LEVEL_REPORTS = {
 const PAGE_SIZE = 50;
 const LEVEL_NAMES = { 1: 'Distributors', 2: 'Sub-Distributors', 3: 'Retailers' };
 
+// Colour identity per hierarchy level, reused by the Executive Summary blocks so
+// Distributor / Sub-Distributor / Retailer read the same everywhere on the page.
+const LEVEL_TONES = {
+  1: { band: 'from-indigo-50/70 to-transparent', solid: 'from-indigo-500 to-purple-600', chip: 'bg-indigo-50 text-indigo-700' },
+  2: { band: 'from-cyan-50/70 to-transparent', solid: 'from-cyan-500 to-blue-600', chip: 'bg-cyan-50 text-cyan-700' },
+  3: { band: 'from-emerald-50/70 to-transparent', solid: 'from-emerald-500 to-green-600', chip: 'bg-emerald-50 text-emerald-700' },
+};
+
 export default function ChannelReports() {
   const [kpis, setKpis] = useState(null);
   const [matrix, setMatrix] = useState(null);
@@ -178,6 +186,31 @@ export default function ChannelReports() {
     ];
   }, [kpis]);
 
+  // Per-level headline numbers, straight from the register's level breakdown
+  // (the convenience counts stand in when by_level is absent).
+  const levelStat = useCallback((lvl) => {
+    const row = (kpis?.by_level || []).find((r) => Number(r.level) === lvl) || {};
+    const fallback = { 1: kpis?.distributors, 2: kpis?.sub_distributors, 3: kpis?.retailers }[lvl];
+    return {
+      entities: Number(row.entities) || Number(fallback) || 0,
+      active: Number(row.active_entities) || 0,
+      inactive: Number(row.inactive_entities) || 0,
+    };
+  }, [kpis]);
+
+  // Domain split for a single level, folded out of the category breakdown.
+  const levelDomains = useCallback((lvl) => {
+    const map = new Map();
+    (kpis?.by_category || []).forEach((r) => {
+      if (Number(r.level) !== lvl) return;
+      const key = r.domain_name || r.domain_code || 'Unspecified';
+      map.set(key, (map.get(key) || 0) + (Number(r.entities) || 0));
+    });
+    return [...map.entries()]
+      .map(([label, entities]) => ({ label, entities }))
+      .sort((a, b) => b.entities - a.entities);
+  }, [kpis]);
+
   const statusDonut = useMemo(() => ([
     { name: 'Active', value: Number(kpis?.active_entities) || 0, fill: '#10b981' },
     { name: 'Canceled', value: Number(kpis?.canceled_entities) || 0, fill: '#ef4444' },
@@ -206,6 +239,11 @@ export default function ChannelReports() {
     () => (coverage?.by_area || []).slice(0, 12).map(a => ({ name: a.area, retailers: a.retailers })),
     [coverage]
   );
+
+  // Upstream coverage roll-up and the three level headlines, so every block of
+  // the Executive Summary reads from the same authoritative numbers.
+  const upline = coverage?.upline || {};
+  const l1 = levelStat(1), l2 = levelStat(2), l3 = levelStat(3);
 
   if (loading && !kpis) {
     return (
@@ -295,6 +333,131 @@ export default function ChannelReports() {
               sub="Distinct place names on the register"
               tone="from-fuchsia-500 to-purple-600"
             />
+          </div>
+
+          {/* ── Executive summary, level by level ────────────────────────────
+              The register reads top-down: Distributors first, then the
+              Sub-Distributors beneath them, then the Retailers. Each level gets
+              its own block so the whole chain is legible at a glance. */}
+          <div className="space-y-6">
+            <div className="flex items-center gap-2">
+              <span className="h-1 w-8 rounded-full bg-gradient-to-r from-blue-600 to-indigo-600" />
+              <h2 className="text-sm font-bold uppercase tracking-wider text-gray-700">The Chain, Level by Level</h2>
+            </div>
+
+            {/* Level 1 — Distributors */}
+            <LevelSection
+              badge="Level 1"
+              title="Distributors"
+              blurb="The top of the chain — every Distributor on the register and the network beneath them."
+              icon={<Building2 size={18} />}
+              tone={LEVEL_TONES[1]}
+              actionLabel="Distributor Ranking"
+              onAction={() => setActiveReport('ranking')}
+              stats={[
+                { icon: <Building2 size={14} />, label: 'Registered', value: fmtNum(l1.entities), sub: 'Distributors on the register' },
+                { icon: <CheckCircle2 size={14} />, label: 'Active', value: fmtNum(l1.active), sub: pct(l1.active, l1.entities).toFixed(0) + '% of the level' },
+                { icon: <AlertTriangle size={14} />, label: 'Inactive', value: fmtNum(l1.inactive), sub: 'Records needing follow-up' },
+                { icon: <CornerDownRight size={14} />, label: 'Sub-Distributors', value: fmtNum(kpis.subs_under_distributors), sub: `${fmtNum(kpis.retailers_under_distributors)} retailers beneath` },
+              ]}
+            >
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <ChartCard title="Top Distributors by Downstream Users" note="How many Sub-Distributors and Retailers hang beneath each Distributor" icon={<Users size={16} />}>
+                  {rankingBars.length === 0 ? (
+                    <EmptyChart label="No Distributor has downstream users yet" />
+                  ) : (
+                    <ResponsiveContainer width="100%" height={Math.max(260, rankingBars.length * 30)}>
+                      <BarChart data={rankingBars} layout="vertical" margin={{ left: 8, right: 24 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                        <XAxis type="number" allowDecimals={false} tick={{ fontSize: 11 }} />
+                        <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={170} />
+                        <Tooltip formatter={(v) => fmtNum(v)} contentStyle={{ borderRadius: 12, border: '1px solid #e2e8f0', fontSize: 12 }} />
+                        <Bar dataKey="users" name="Downstream users" fill="#6366f1" radius={[0, 4, 4, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  )}
+                </ChartCard>
+                <DimensionSplit title="Distributors by Domain" note="Where the Distributor base sits across domains" rows={levelDomains(1)} />
+              </div>
+            </LevelSection>
+
+            {/* Level 2 — Sub-Distributors */}
+            <LevelSection
+              badge="Level 2"
+              title="Sub-Distributors"
+              blurb="The middle of the chain — the Sub-Distributors that sit between Distributors and the retailer base."
+              icon={<Layers size={18} />}
+              tone={LEVEL_TONES[2]}
+              actionLabel="Sub-Distributor Report"
+              onAction={() => setActiveReport('sub_distributor')}
+              stats={[
+                { icon: <Layers size={14} />, label: 'Registered', value: fmtNum(l2.entities), sub: 'Sub-Distributors on the register' },
+                { icon: <CheckCircle2 size={14} />, label: 'Active', value: fmtNum(l2.active), sub: pct(l2.active, l2.entities).toFixed(0) + '% of the level' },
+                { icon: <AlertTriangle size={14} />, label: 'Inactive', value: fmtNum(l2.inactive), sub: 'Records needing follow-up' },
+                { icon: <CornerDownRight size={14} />, label: 'Retailers beneath', value: fmtNum(kpis.retailers_under_sub_distributors), sub: 'Reporting through a Sub-Distributor' },
+              ]}
+            >
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <DimensionSplit title="Sub-Distributors by Domain" note="Where the Sub-Distributor base sits across domains" rows={levelDomains(2)} />
+                <CoverageMeter
+                  title="Retailer Reach"
+                  note="How many Sub-Distributors have at least one retailer reporting to them"
+                  covered={upline.sub_distributors?.covered}
+                  total={upline.sub_distributors?.total}
+                  tail="retailer"
+                />
+              </div>
+            </LevelSection>
+
+            {/* Level 3 — Retailers */}
+            <LevelSection
+              badge="Level 3"
+              title="Retailers"
+              blurb="The bottom of the chain — the retailer base that actually sells, and where it reaches."
+              icon={<Store size={18} />}
+              tone={LEVEL_TONES[3]}
+              actionLabel="Retailer Report"
+              onAction={() => setActiveReport('retailer')}
+              stats={[
+                { icon: <Store size={14} />, label: 'Registered', value: fmtNum(l3.entities), sub: 'Retailers on the register' },
+                { icon: <CheckCircle2 size={14} />, label: 'Active', value: fmtNum(l3.active), sub: pct(l3.active, l3.entities).toFixed(0) + '% of the level' },
+                { icon: <AlertTriangle size={14} />, label: 'Inactive', value: fmtNum(l3.inactive), sub: 'Records needing follow-up' },
+                { icon: <MapPinned size={14} />, label: 'Areas covered', value: fmtNum(cov.areas_with_retailers), sub: `of ${fmtNum(cov.total_areas)} areas on the register` },
+              ]}
+            >
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <ChartCard title="Retailers by Area" note="The areas carrying the most retailers" icon={<MapPinned size={16} />}>
+                  {covAreaBars.length === 0 ? (
+                    <EmptyChart label="No retailer is placed yet" />
+                  ) : (
+                    <ResponsiveContainer width="100%" height={Math.max(260, covAreaBars.length * 30)}>
+                      <BarChart data={covAreaBars} layout="vertical" margin={{ left: 8, right: 24 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                        <XAxis type="number" allowDecimals={false} tick={{ fontSize: 11 }} />
+                        <YAxis type="category" dataKey="name" tick={{ fontSize: 11 }} width={150} />
+                        <Tooltip formatter={(v) => fmtNum(v)} contentStyle={{ borderRadius: 12, border: '1px solid #e2e8f0', fontSize: 12 }} />
+                        <Bar dataKey="retailers" name="Retailers" fill="#10b981" radius={[0, 4, 4, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  )}
+                </ChartCard>
+                <DimensionSplit title="Retailers by Domain" note="Where the retailer base sits across domains" rows={levelDomains(3)} />
+              </div>
+              {(coverage?.gaps || []).length > 0 && (
+                <div className="rounded-xl border border-amber-100 bg-amber-50/50 p-4">
+                  <p className="text-xs font-semibold text-amber-900 mb-2">
+                    {fmtNum(coverage.gaps.length)} area(s) have users but no retailer yet
+                  </p>
+                  <div className="flex flex-wrap gap-2 max-h-[120px] overflow-y-auto">
+                    {coverage.gaps.slice(0, 18).map((g) => (
+                      <span key={g.area} className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-md bg-white border border-amber-200 text-amber-900">
+                        <AlertTriangle size={11} /> {g.area} · {fmtNum(g.entities)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </LevelSection>
           </div>
 
           {/* Level composition + status mix */}
@@ -797,7 +960,7 @@ function LevelReport({
       { key: 'status', label: 'Status' },
       ...(spec.parentColumn ? [{ key: 'parent', label: spec.parentColumn }] : []),
       ...(spec.level === 3 ? [{ key: 'owner', label: 'Distributor' }] : []),
-      { key: 'location', label: 'Location' },
+      { key: 'location', label: 'Street Address' },
       ...(spec.level === 1 ? [
         { key: 'subdists', label: 'Sub-Dists' },
         { key: 'retailers', label: 'Retailers' },
@@ -926,7 +1089,7 @@ function LevelReport({
                   {spec.level === 3 && show('owner') && (
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Distributor</th>
                   )}
-                  {show('location') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Location</th>}
+                  {show('location') && <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600">Street Address</th>}
                   {spec.level === 1 && show('subdists') && (
                     <th className="px-4 py-3 text-right text-xs font-semibold text-gray-600">Sub-Dists</th>
                   )}
@@ -1331,7 +1494,7 @@ function VerifySingleTinModal({ isOpen, onClose, entity, onVerified }) {
 const BATCH_FIELD_OPTIONS = [
   { key: 'business_name', label: 'Business Name' },
   { key: 'phone', label: 'Phone Number' },
-  { key: 'location', label: 'Location (Sub-City, Woreda, House No)' },
+  { key: 'location', label: 'Street Address (Sub-City, Woreda, House No)' },
   { key: 'geo_domain', label: 'Geographical Domain' },
   { key: 'photo', label: 'Manager Photo (replaces custom uploads)' },
 ];
@@ -1707,6 +1870,81 @@ function SummaryItem({ label, value, sub }) {
       <p className="text-xl font-bold text-gray-900 mt-1">{value}</p>
       {sub && <p className="text-[11px] text-gray-400 mt-0.5">{sub}</p>}
     </div>
+  );
+}
+
+/** A compact figure tile used inside a level block of the Executive Summary. */
+function MiniStat({ icon, label, value, sub }) {
+  return (
+    <div className="rounded-xl border border-gray-100 bg-gray-50/70 p-4">
+      <div className="flex items-center gap-1.5 text-gray-500">
+        {icon}
+        <p className="text-[11px] font-semibold uppercase tracking-wider">{label}</p>
+      </div>
+      <p className="text-xl font-bold text-gray-900 mt-2 tabular-nums">{value}</p>
+      {sub && <p className="text-[11px] text-gray-500 mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+/** A coverage bar — "how many of these have at least one of those". */
+function CoverageMeter({ title, note, covered, total, tail }) {
+  const c = Number(covered) || 0;
+  const t = Number(total) || 0;
+  const share = t ? (c / t) * 100 : 0;
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200/80 shadow-sm p-5">
+      <h3 className="text-sm font-semibold text-gray-800">{title}</h3>
+      {note && <p className="text-[11px] text-gray-500 mt-0.5 mb-3">{note}</p>}
+      <div className="flex items-center justify-between text-xs mb-1.5">
+        <span className="font-medium text-gray-600">{fmtNum(c)} of {fmtNum(t)}</span>
+        <span className="text-gray-500 tabular-nums">{share.toFixed(0)}% covered</span>
+      </div>
+      <div className="h-2.5 rounded-full bg-gray-100 overflow-hidden">
+        <div className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-600 transition-all duration-700" style={{ width: `${share}%` }} />
+      </div>
+      <p className="text-[11px] text-gray-400 mt-2">{fmtNum(Math.max(0, t - c))} have no {tail} yet</p>
+    </div>
+  );
+}
+
+/**
+ * One level's block in the Executive Summary — a titled header with the level's
+ * own figures and charts, so the chain reads Distributor → Sub-Distributor →
+ * Retailer. `tone` comes from LEVEL_TONES.
+ */
+function LevelSection({ badge, title, blurb, icon, tone, stats, actionLabel, onAction, children }) {
+  return (
+    <section className="bg-white rounded-2xl border border-gray-200/80 shadow-sm overflow-hidden">
+      <div className={'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-5 py-4 border-b border-gray-100 bg-gradient-to-r ' + tone.band}>
+        <div className="flex items-center gap-3">
+          <span className={'inline-flex items-center justify-center w-9 h-9 rounded-xl text-white bg-gradient-to-br shadow-sm shrink-0 ' + tone.solid}>
+            {icon}
+          </span>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className={'text-[10px] font-bold px-1.5 py-0.5 rounded ' + tone.chip}>{badge}</span>
+              <h3 className="text-sm font-semibold text-gray-800">{title}</h3>
+            </div>
+            <p className="text-[11px] text-gray-500 mt-0.5">{blurb}</p>
+          </div>
+        </div>
+        {onAction && (
+          <button
+            onClick={onAction}
+            className="self-start sm:self-auto inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-sm transition"
+          >
+            {actionLabel} <ChevronRight size={14} />
+          </button>
+        )}
+      </div>
+      <div className="p-5 space-y-5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {stats.map((s, i) => <MiniStat key={i} {...s} />)}
+        </div>
+        {children}
+      </div>
+    </section>
   );
 }
 

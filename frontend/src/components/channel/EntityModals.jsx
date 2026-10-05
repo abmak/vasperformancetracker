@@ -8,6 +8,7 @@ import toast from 'react-hot-toast';
 import ManagerPhoto from './ManagerPhoto';
 import { fileToBase64 } from '../../utils/helpers';
 import { buildVerifyChoices } from '../../utils/verifyChoices';
+import { LocationCapture } from './LocationCapture';
 
 // Edit & Delete entity modals shared by Channel Reports (level tables) and the
 // Channel Dashboard's Entity Registry — one behaviour, one place to fix it.
@@ -25,6 +26,11 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
   const [verifyChoices, setVerifyChoices] = useState([]);
   const [replaceSel, setReplaceSel] = useState({});
   const [applyingVerify, setApplyingVerify] = useState(false);
+  // GPS capture for retailer edits — the same widget Single Registration uses.
+  // gpsTouched marks whether the operator changed the position in this edit;
+  // the backend only rewrites coordinates when the payload carries them.
+  const [gps, setGps] = useState(null);
+  const [gpsTouched, setGpsTouched] = useState(false);
 
   useEffect(() => {
     if (entity) {
@@ -48,6 +54,15 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
       setVerifyRes(null);
       setVerifyChoices([]);
       setReplaceSel({});
+      // A retailer saved with a position keeps it visible (and re-capturable):
+      // capturedAt stays null so the widget reads “Previously captured”.
+      setGps(entity.latitude != null && entity.longitude != null ? {
+        latitude: Number(entity.latitude),
+        longitude: Number(entity.longitude),
+        accuracy: entity.location_accuracy_m != null ? Number(entity.location_accuracy_m) : null,
+        capturedAt: null,
+      } : null);
+      setGpsTouched(false);
     }
   }, [entity]);
 
@@ -173,6 +188,25 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
     }
   }
 
+  /** GPS edits flow through here: the widget reports the raw capture, and —
+   *  once Nominatim resolves it — the address parts on top. Address parts only
+   *  ever fill blanks: an operator's own text is never overwritten. */
+  function handleGpsEdit(next) {
+    setGps(next);
+    setGpsTouched(true);
+    if (next?.address) {
+      setForm((prev) => ({
+        ...prev,
+        location: prev.location.trim()
+          ? prev.location
+          : (next.address.composed || '').slice(0, 255),
+        geo_domain_raw: prev.geo_domain_raw.trim()
+          ? prev.geo_domain_raw
+          : (next.address.city || ''),
+      }));
+    }
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     if (!form.user_name?.trim()) {
@@ -181,7 +215,25 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
     }
     setLoading(true);
     try {
-      await channelAPI.updateEntity(entity.id, form);
+      // Coordinates ride along only when this edit touched them — and an
+      // explicit removal sends nulls, which clears the stored fix server-side.
+      const payload = { ...form };
+      if (gpsTouched) {
+        if (gps && gps.latitude != null && gps.longitude != null) {
+          payload.latitude = gps.latitude;
+          payload.longitude = gps.longitude;
+          if (gps.accuracy != null) payload.location_accuracy = gps.accuracy;
+          if (gps.address) {
+            payload.addr_country = gps.address.country || null;
+            payload.addr_city = gps.address.city || null;
+            payload.addr_street = gps.address.street || null;
+          }
+        } else {
+          payload.latitude = null;
+          payload.longitude = null;
+        }
+      }
+      await channelAPI.updateEntity(entity.id, payload);
       toast.success('Record updated successfully');
       if (onUpdated) onUpdated();
       onClose();
@@ -440,9 +492,10 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
               />
             </div>
 
-            {/* Location */}
+            {/* Street address — the composed Sub-City / Woreda / House string
+                (named 'location' on the record for history's sake). */}
             <div className="sm:col-span-2">
-              <label className="block font-semibold text-gray-700 mb-1">Physical Location / Address</label>
+              <label className="block font-semibold text-gray-700 mb-1">Street Address Information</label>
               <input
                 type="text"
                 value={form.location || ''}
@@ -451,6 +504,16 @@ export function EditEntityModal({ isOpen, onClose, entity, onUpdated }) {
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500"
               />
             </div>
+
+            {/* GPS capture — retailer-only, optional. Same widget as Single
+                Registration: the position comes from the operator's device and
+                is reverse-geocoded in the browser, so an imported retailer can
+                gain coordinates without being re-registered. */}
+            {Number(entity.level) === 3 && (
+              <div className="sm:col-span-2">
+                <LocationCapture value={gps} onChange={handleGpsEdit} />
+              </div>
+            )}
 
             {/* Sub-City, Woreda, House No */}
             <div>
