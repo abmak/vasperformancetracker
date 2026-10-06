@@ -27,6 +27,7 @@ export async function request(endpoint, options = {}) {
 // System health (master admin)
 export const systemAPI = {
   getHealth: () => request('/system/health'),
+  controlSync: (action) => request(`/system/sync/${action}`, { method: 'POST' }),
 };
 
 // Services

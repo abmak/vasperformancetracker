@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
+import toast from 'react-hot-toast';
 import {
   Activity, Server, Database, RefreshCw, CheckCircle2, XCircle, AlertTriangle,
   Clock, ShieldAlert, ArrowRightLeft, HardDrive, Gauge, Lock, Archive,
-  History, MemoryStick, HardDriveDownload, Info,
+  History, MemoryStick, HardDriveDownload, Info, Camera, Pause, Play,
+  ListChecks,
 } from 'lucide-react';
 import { systemAPI } from '../services/api';
 
@@ -82,6 +84,7 @@ export default function SystemHealth() {
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [syncBusy, setSyncBusy] = useState(false);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -95,6 +98,23 @@ export default function SystemHealth() {
       setRefreshing(false);
     }
   }, []);
+
+  const controlSync = useCallback(async (action) => {
+    if (action === 'pause' && !window.confirm(
+      'Pause the primary→standby sync?\n\n- The standby keeps its last copied data\n- Automatic failback is disabled while paused\n- Failover itself still works (the app handles it)\n\nResume anytime from this page.'
+    )) return;
+    setSyncBusy(true);
+    try {
+      const r = await systemAPI.controlSync(action);
+      if (r.warning) toast(r.warning, { icon: '⏸️', duration: 6000 });
+      else toast.success('Sync daemon ' + (action === 'pause' ? 'paused' : 'resumed'));
+      await load();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [load]);
 
   useEffect(() => {
     load();
@@ -125,6 +145,16 @@ export default function SystemHealth() {
   const tlsTone = !tls ? 'gray'
     : tls.daysLeft <= 1 ? 'red' : tls.daysLeft <= 2.5 ? 'amber' : 'emerald';
   const backupTone = !backup || backup.ok == null ? 'gray' : backup.ok ? 'emerald' : 'red';
+  const cpu = data?.cpu;
+  const cpuTone = !cpu || cpu.usagePct == null ? 'gray'
+    : cpu.usagePct >= 85 ? 'red' : cpu.usagePct >= 60 ? 'amber' : 'emerald';
+  const snapshots = data?.snapshots;
+  const snapTone = !snapshots ? 'gray'
+    : !snapshots.newest ? 'amber'
+      : snapshots.newest.ageHours > 2 ? 'amber' : 'emerald';
+  const processes = data?.processes || null;
+  const daemonProc = processes && processes.find((p) => p.name === 'db-sync');
+  const daemonPaused = daemonProc ? daemonProc.status !== 'online' : null;
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -334,6 +364,33 @@ export default function SystemHealth() {
                 ? `${server.memory.freeMb} MB free of ${server.memory.totalMb} MB`
                 : 'not available'}
             />
+            <MetricBar
+              label="CPU usage"
+              icon={Gauge}
+              usedPct={cpu?.usagePct}
+              tone={cpuTone}
+              detail={cpu
+                ? `${cpu.coreCount} cores · load ${cpu.loadAvg ? cpu.loadAvg.join(' / ') : '—'}${cpu.cores ? ' · per-core ' + cpu.cores.join('%/') + '%' : ''}`
+                : 'not available'}
+            />
+            <StatusCard
+              title="Hourly snapshots"
+              icon={Camera}
+              up={snapshots ? (snapshots.newest && snapshots.newest.ageHours <= 2) : null}
+              tone={snapTone}
+              sub={snapshots ? (
+                <>
+                  <div>
+                    {snapshots.newest
+                      ? `newest: ${snapshots.newest.ageHours}h ago · ${(snapshots.newest.sizeBytes / 1024).toFixed(0)} KB`
+                      : 'none taken yet'}
+                  </div>
+                  <div>{snapshots.count} snapshot(s) kept (hourly, last 6)</div>
+                </>
+              ) : (
+                <div>Snapshot store lives on the production VPS</div>
+              )}
+            />
             <StatusCard
               title="TLS certificate"
               icon={Lock}
@@ -376,6 +433,72 @@ export default function SystemHealth() {
                 <div>backup folder not readable</div>
               )}
             />
+          </div>
+
+          {/* Sync controller + pm2 services */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div className="rounded-xl border border-gray-200 bg-white p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                  <ArrowRightLeft className="w-4 h-4 text-gray-500" />
+                  Primary → standby sync controller
+                </div>
+                {daemonProc ? (
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${daemonPaused ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                    {daemonPaused ? 'PAUSED' : 'RUNNING'}
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">N/A</span>
+                )}
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                Every 2 minutes the whole database is copied primary → standby. Pausing stops new copies and
+                disables automatic failback; failover itself is handled by the app and keeps working.
+              </p>
+              {daemonPaused != null && !devMode && (
+                <button
+                  onClick={() => controlSync(daemonPaused ? 'resume' : 'pause')}
+                  disabled={syncBusy}
+                  className={`mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold rounded-lg text-white disabled:opacity-50 ${
+                    daemonPaused
+                      ? 'bg-emerald-600 hover:bg-emerald-700'
+                      : 'bg-red-600 hover:bg-red-700'
+                  }`}
+                >
+                  {daemonPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+                  {daemonPaused ? 'Resume sync' : 'Pause sync'}
+                </button>
+              )}
+              {devMode && (
+                <div className="mt-2 text-xs text-blue-700">The sync daemon runs on the production VPS only.</div>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-gray-200 bg-white p-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-gray-800 mb-2">
+                <ListChecks className="w-4 h-4 text-gray-500" />
+                Services (pm2)
+              </div>
+              {processes ? (
+                <div className="space-y-1">
+                  {processes.map((p) => (
+                    <div key={p.name} className="flex items-center justify-between text-xs py-1 border-b border-gray-50 last:border-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2 h-2 rounded-full ${p.status === 'online' ? 'bg-emerald-500' : p.status === 'stopped' ? 'bg-gray-400' : 'bg-red-500'}`} />
+                        <span className="font-medium text-gray-700">{p.name}</span>
+                      </div>
+                      <div className="flex items-center gap-3 text-gray-500">
+                        <span>{p.memMb} MB</span>
+                        <span title="restart count">↺ {p.restarts}</span>
+                        <span className={`font-semibold w-14 text-right ${p.status === 'online' ? 'text-emerald-600' : 'text-gray-500'}`}>{p.status}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-gray-400">pm2 process list unavailable on this machine.</div>
+              )}
+            </div>
           </div>
 
           {/* Incident timeline */}

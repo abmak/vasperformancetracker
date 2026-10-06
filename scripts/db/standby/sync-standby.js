@@ -243,6 +243,8 @@ async function maybeSnapshot(dumpBuf) {
       + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.sql.gz';
     fs.writeFileSync(path.join(SNAP_DIR, name), zlib.gzipSync(dumpBuf, { level: 6 }));
     lastSnapshot = now;
+    const kept = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.sql.gz')).length;
+    writeStatusFile({ lastSnapshotAt: new Date().toISOString(), snapshotCount: kept, lastSnapshotBytes: dumpBuf.length });
     // prune old snapshots beyond SNAP_KEEP
     const snaps = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.sql.gz'))
       .map((f) => ({ f, t: fs.statSync(path.join(SNAP_DIR, f)).mtimeMs }))

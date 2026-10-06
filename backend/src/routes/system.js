@@ -3,9 +3,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const mysql2 = require('mysql2/promise');
+const { execFile } = require('child_process');
 const router = express.Router();
 const db = require('../config/database');
 const { isMasterAdmin } = require('../middleware/permissions');
+const { recordFailoverEvent } = require('../config/dbFailoverEvents');
 
 /**
  * GET /api/system/health — master-admin system health panel.
@@ -176,6 +178,84 @@ function mergeTimelines(daemonEvents, dbEvents) {
   return merged;
 }
 
+// ------------------------------------------------------------ cpu probe ---
+// Instantaneous CPU snapshot: sample per-core times twice, 300ms apart.
+async function cpuUsage() {
+  const snap = () => os.cpus().map((c) => ({ ...c.times }));
+  const s1 = snap();
+  await new Promise((r) => setTimeout(r, 300));
+  const s2 = snap();
+  let busyAll = 0;
+  let totalAll = 0;
+  const cores = [];
+  for (let i = 0; i < s2.length; i++) {
+    const a = s1[i];
+    const b = s2[i];
+    const busy = (b.user - a.user) + (b.nice - a.nice) + (b.sys - a.sys) + (b.irq - a.irq);
+    const total = busy + (b.idle - a.idle);
+    busyAll += busy;
+    totalAll += total;
+    cores.push(total > 0 ? Math.round((busy / total) * 100) : 0);
+  }
+  return {
+    usagePct: totalAll > 0 ? Math.round((busyAll / totalAll) * 100) : null,
+    cores,
+    coreCount: s2.length,
+    loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
+  };
+}
+
+// ------------------------------------------------------------- snapshots ---
+// Hourly standby snapshots taken by the sync daemon (~/backups/standby-snapshots).
+function snapshotCheck() {
+  try {
+    const dir = path.join(BACKUPS_DIR, 'standby-snapshots');
+    const files = fs.readdirSync(dir)
+      .filter((f) => f.endsWith('.sql.gz'))
+      .map((f) => ({
+        name: f,
+        sizeBytes: fs.statSync(path.join(dir, f)).size,
+        mtime: fs.statSync(path.join(dir, f)).mtime.toISOString(),
+      }))
+      .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
+    if (!files.length) return { count: 0 };
+    const ageHours = Number(((Date.now() - Date.parse(files[0].mtime)) / 3600000).toFixed(1));
+    return { count: files.length, newest: { name: files[0].name, ageHours, sizeBytes: files[0].sizeBytes } };
+  } catch (e) {
+    return null; // dev machine / dir missing
+  }
+}
+
+// ------------------------------------------------------------------- pm2 ---
+function pm2List() {
+  return new Promise((resolve) => {
+    execFile('pm2', ['jlist'], { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(null);
+      try {
+        const arr = JSON.parse(stdout);
+        resolve(arr.map((p) => ({
+          name: p.name,
+          status: p.pm2_env && p.pm2_env.status,
+          memMb: Math.round(((p.monit && p.monit.memory) || 0) / 1048576),
+          restarts: (p.pm2_env && p.pm2_env.restart_time) || 0,
+          uptimeMs: p.pm2_env && p.pm2_env.pm_uptime ? Date.now() - p.pm2_env.pm_uptime : null,
+        })));
+      } catch (e) { resolve(null); }
+    });
+  });
+}
+
+function pm2Act(action, name) {
+  return new Promise((resolve) => {
+    execFile('pm2', [action, name], { timeout: 20000 }, (err, stdout) => {
+      resolve({
+        ok: !err,
+        output: err ? String(err.message).slice(0, 200) : String(stdout).split('\n').filter(Boolean).pop() || '',
+      });
+    });
+  });
+}
+
 // isMasterAdmin() is a boolean predicate, not middleware — wrap it.
 function requireMasterAdmin(req, res, next) {
   if (!isMasterAdmin(req)) {
@@ -207,12 +287,15 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
       ? probeServer(targets.standby.host, targets.standby.port)
       : Promise.resolve(null);
 
-    const [primary, standby, dbEvents, tls, stats] = await Promise.all([
+    const [primary, standby, dbEvents, tls, stats, cpu, processes, snapshots] = await Promise.all([
       probePrimary,
       probeStandby,
       recentDbEvents(),
       tlsCertExpiry(),
       Promise.resolve(serverStats()),
+      cpuUsage(),
+      pm2List(),
+      Promise.resolve(snapshotCheck()),
     ]);
 
     const backup = backupCheck();
@@ -244,6 +327,9 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
         daemonSecondsAgo: fileAgeSeconds(sync.updatedAt),
       },
       server: stats,
+      cpu,
+      processes,
+      snapshots,
       tls: tls && {
         expiresAt: tls.expiresAt,
         daysLeft: tls.daysLeft,
@@ -256,6 +342,35 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
     console.error('[system-health]', e);
     res.status(500).json({ error: 'health check failed' });
   }
+});
+
+// Sync controller — pause/resume the db-sync daemon (pm2) from the UI.
+router.post('/sync/:action', requireMasterAdmin, async (req, res) => {
+  const action = String(req.params.action);
+  if (action !== 'pause' && action !== 'resume') {
+    return res.status(400).json({ error: 'action must be pause or resume' });
+  }
+  const pm2Action = action === 'pause' ? 'stop' : 'start';
+  const result = await pm2Act(pm2Action, 'db-sync');
+  if (!result.ok) {
+    return res.status(500).json({ error: 'pm2 ' + pm2Action + ' db-sync failed: ' + result.output });
+  }
+  const procs = await pm2List();
+  const daemon = procs && procs.find((p) => p.name === 'db-sync');
+  try {
+    await recordFailoverEvent(
+      action === 'pause' ? 'SYNC_PAUSED' : 'SYNC_RESUMED',
+      'Primary→standby sync ' + (action === 'pause' ? 'PAUSED' : 'RESUMED') + ' by ' + (req.user.email || req.user.username || 'master admin')
+    );
+  } catch (e) { /* best-effort */ }
+  res.json({
+    ok: true,
+    action,
+    daemon: daemon ? { status: daemon.status, memMb: daemon.memMb } : null,
+    warning: action === 'pause'
+      ? 'Sync paused — the standby keeps its last data and automatic failback is disabled until you resume.'
+      : null,
+  });
 });
 
 module.exports = router;
