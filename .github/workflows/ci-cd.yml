@@ -136,8 +136,14 @@ jobs:
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           if [ -n "$KEY" ]; then
-            printf '%s\n' "$KEY" > "$SSH_KEY"
+            # Strip CR characters (keys copied on Windows often carry CRLF,
+            # which OpenSSH rejects with 'invalid format'), ensure the file
+            # ends with exactly one newline, and require the correct header.
+            printf '%s\n' "$KEY" | tr -d '\r' > "$SSH_KEY"
             chmod 600 "$SSH_KEY"
+            head -1 "$SSH_KEY" | grep -q 'BEGIN OPENSSH PRIVATE KEY' \
+              || { echo '::error::SSH_PRIVATE_KEY does not look like an OpenSSH private key — paste the contents of scripts/deploy/gha_deploy_ed25519 (the PRIVATE key file), including BEGIN/END lines'; exit 1; }
+            ssh-keygen -y -f "$SSH_KEY" > /tmp/derived.pub && echo "key parses OK (fingerprint: $(ssh-keygen -lf /tmp/derived.pub))"
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
