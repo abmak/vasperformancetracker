@@ -63,7 +63,13 @@ app.use('/api/auth', authRoutes);
 
 // Health check — no token required
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  const db = require('./config/database');
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    dbTarget: db.__dbTarget,
+    dbFailover: db.__failoverEnabled,
+  });
 });
 
 // ACME HTTP-01 challenge answers (Let's Encrypt). The TLS certificate for the
