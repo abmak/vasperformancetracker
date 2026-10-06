@@ -52,6 +52,16 @@ jobs:
       - name: Syntax-check every source file
         working-directory: backend
         run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Base setup (users, roles, permissions tables)
+        working-directory: backend
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_USER: vas_user
+          DB_PASSWORD: civaspass
+          DB_NAME: vas_revenue_tracking
+          JWT_SECRET: ci-secret
+        run: npm run db:setup
       - name: Smoke test — ensure schema against real MySQL 8
         working-directory: backend
         env:
@@ -89,9 +99,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Tailwind CSS v4 requires Node >= 20 to build — frontend uses 20,
+      # backend keeps 18 (parity with the VPS runtime).
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
@@ -132,11 +144,11 @@ jobs:
             echo "SSH_PRIVATE_KEY secret not set — deploy skipped. See scripts/DEPLOY.md → 'GitHub Actions CI/CD'."
           fi
 
-      - name: Setup Node 18
+      - name: Setup Node 20 (frontend build)
         if: steps.keycheck.outputs.found == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 

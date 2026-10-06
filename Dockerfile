@@ -12,7 +12,8 @@
 # 127.0.0.1 exactly like the pm2 process did.
 
 # ---- stage 1: build the React frontend -------------------------------------
-FROM node:18-alpine AS frontend-build
+# node:20 — Tailwind CSS v4 requires >= 20 to build.
+FROM node:20-alpine AS frontend-build
 WORKDIR /fe
 COPY frontend/package*.json ./
 RUN npm ci
