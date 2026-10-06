@@ -148,19 +148,22 @@ function backupCheck() {
         return { name: f, sizeBytes: st.size, mtime: st.mtime.toISOString() };
       })
       .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
-    if (!files.length) return { ok: false, problem: 'no vas-*.sql.gz backups found in ~/backups' };
+    if (!files.length) return { configured: true, ok: false, problem: 'no vas-*.sql.gz backups found in ~/backups' };
     const newest = files[0];
     const ageHours = Number(((Date.now() - Date.parse(newest.mtime)) / 3600000).toFixed(1));
     // <1KB gzip ≈ empty dump (the old cron bug — spaces-privilege issue)
     const looksEmpty = newest.sizeBytes < 1000;
     return {
+      configured: true,
       ok: ageHours < 26 && !looksEmpty,
       newest: { name: newest.name, sizeBytes: newest.sizeBytes, ageHours, mtime: newest.mtime },
       backupCount: files.length,
       problem: looksEmpty ? 'newest backup looks empty (<1KB)' : ageHours >= 26 ? 'no fresh backup in 26h' : null,
     };
   } catch (e) {
-    return { ok: false, problem: 'cannot read backups dir: ' + e.message };
+    // Dev machines have no ~/backups — neutral state, not an error.
+    if (e.code === 'ENOENT') return { configured: false };
+    return { configured: true, ok: false, problem: 'cannot read backups dir: ' + e.message };
   }
 }
 

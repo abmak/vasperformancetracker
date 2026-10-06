@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Activity, Server, Database, RefreshCw, CheckCircle2, XCircle, AlertTriangle,
   Clock, ShieldAlert, ArrowRightLeft, HardDrive, Gauge, Lock, Archive,
-  History, MemoryStick, HardDriveDownload,
+  History, MemoryStick, HardDriveDownload, Info,
 } from 'lucide-react';
 import { systemAPI } from '../services/api';
 
@@ -114,6 +114,9 @@ export default function SystemHealth() {
   const backup = data?.backup;
   const timeline = data?.timeline || [];
   const staleSync = sync?.lastSyncSecondsAgo != null && sync.lastSyncSecondsAgo > 360;
+  // Dev machine: no standby configured → sync/daemon/backup cards are
+  // production-only and must show neutral, not alarming, states.
+  const devMode = Boolean(data && !data.failover?.standbyConfigured);
 
   const diskTone = !server?.disk ? null
     : server.disk.usedPct >= 85 ? 'red' : server.disk.usedPct >= 70 ? 'amber' : 'emerald';
@@ -121,7 +124,7 @@ export default function SystemHealth() {
     : server.memory.usedPct >= 90 ? 'red' : server.memory.usedPct >= 75 ? 'amber' : 'emerald';
   const tlsTone = !tls ? 'gray'
     : tls.daysLeft <= 1 ? 'red' : tls.daysLeft <= 2.5 ? 'amber' : 'emerald';
-  const backupTone = !backup ? 'gray' : backup.ok ? 'emerald' : 'red';
+  const backupTone = !backup || backup.ok == null ? 'gray' : backup.ok ? 'emerald' : 'red';
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -163,6 +166,18 @@ export default function SystemHealth() {
             <div className="text-xs text-red-500 mt-1">
               You need a GLOBAL-scope (master admin) role to view this page.
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dev environment notice */}
+      {data && devMode && (
+        <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 flex items-start gap-2">
+          <Info className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
+          <div className="text-xs text-blue-800">
+            <span className="font-semibold">Development environment.</span> The standby database, 2-minute sync,
+            sync daemon, TLS certificate and nightly backups live on the production VPS — the cards below reflect
+            this machine only. Open the production app (https://196.189.155.179:5000) for the full picture.
           </div>
         </div>
       )}
@@ -251,10 +266,12 @@ export default function SystemHealth() {
             <StatusCard
               title="Last sync (primary → standby)"
               icon={ArrowRightLeft}
-              up={staleSync ? false : Boolean(sync?.lastSyncOk)}
-              tone={staleSync ? 'amber' : undefined}
+              up={devMode ? null : staleSync ? false : Boolean(sync?.lastSyncOk)}
+              tone={devMode ? 'gray' : staleSync ? 'amber' : undefined}
               sub={
-                sync?.lastSyncOk ? (
+                devMode ? (
+                  <div>Sync runs on the production VPS every 2 minutes</div>
+                ) : sync?.lastSyncOk ? (
                   <>
                     <div>{timeAgo(sync.lastSyncOk, sync.lastSyncSecondsAgo)}</div>
                     <div>
@@ -271,23 +288,28 @@ export default function SystemHealth() {
             <StatusCard
               title="Sync daemon"
               icon={Clock}
-              up={sync?.daemonSecondsAgo != null && sync.daemonSecondsAgo < 600}
+              up={devMode ? null : sync?.daemonSecondsAgo != null && sync.daemonSecondsAgo < 600}
+              tone={devMode ? 'gray' : undefined}
               sub={
-                <>
-                  <div>
-                    {sync?.daemonUpdatedAt
-                      ? `reporting (${timeAgo(sync.daemonUpdatedAt, sync.daemonSecondsAgo)})`
-                      : 'no status file — check pm2'}
-                  </div>
-                  {sync?.failbackProbeCount > 0 && (
+                devMode ? (
+                  <div>Daemon (pm2: db-sync) runs on the production VPS</div>
+                ) : (
+                  <>
                     <div>
-                      failback probe {sync.failbackProbeCount}/{sync.failbackProbeRequired}
+                      {sync?.daemonUpdatedAt
+                        ? `reporting (${timeAgo(sync.daemonUpdatedAt, sync.daemonSecondsAgo)})`
+                        : 'no status file — check pm2'}
                     </div>
-                  )}
-                  {sync?.lastFailback && (
-                    <div>last failback {timeAgo(sync.lastFailback, null)}</div>
-                  )}
-                </>
+                    {sync?.failbackProbeCount > 0 && (
+                      <div>
+                        failback probe {sync.failbackProbeCount}/{sync.failbackProbeRequired}
+                      </div>
+                    )}
+                    {sync?.lastFailback && (
+                      <div>last failback {timeAgo(sync.lastFailback, null)}</div>
+                    )}
+                  </>
+                )
               }
             />
           </div>
@@ -334,9 +356,11 @@ export default function SystemHealth() {
             <StatusCard
               title="Nightly backup"
               icon={Archive}
-              up={backup ? backup.ok : null}
-              tone={backupTone}
-              sub={backup ? (
+              up={devMode || !backup || backup.ok == null ? null : backup.ok}
+              tone={devMode ? 'gray' : backupTone}
+              sub={devMode ? (
+                <div>Nightly backups are stored on the production VPS (~/backups)</div>
+              ) : backup ? (
                 <>
                   <div>
                     {backup.newest ? (
@@ -362,7 +386,9 @@ export default function SystemHealth() {
             </div>
             {timeline.length === 0 ? (
               <div className="text-xs text-gray-400 py-2">
-                No events recorded yet — sync runs every 2 minutes and will populate this feed.
+                {devMode
+                  ? 'No events on this machine — incident logging runs with the standby setup on production.'
+                  : 'No events recorded yet — sync runs every 2 minutes and will populate this feed.'}
               </div>
             ) : (
               <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
