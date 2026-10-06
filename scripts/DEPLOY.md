@@ -108,4 +108,67 @@ installed on the box — the helper is plain `bash` and already-present `tar`/`p
 `curl`. The local side needs `git`, `ssh`/`scp`, `tar`, and Node.
 
 `--push` is opt-in and just records the commit on GitHub; pushing is **not** how
-production updates (there is no CI/CD, and the box has no internet anyway).
+production updates — production updates via the GitHub Actions CD pipeline
+(below) or this script.
+
+## GitHub Actions CI/CD
+
+`.github/workflows/ci-cd.yml` runs on every push/PR:
+
+| Job | What it does |
+| --- | --- |
+| `backend` | `npm ci`, syntax-checks every file, boots the API against a real **MySQL 8.0.46 service container** (Docker in CI), runs `ensureChannelSchema` + a `/api/health` smoke test |
+| `frontend` | `npm ci` + production build |
+| `deploy` | on green `main` pushes only: builds, ships the same tarballs over SSH with a **dedicated deploy key**, health-gates the release, **auto-rolls back** to the previous release if the health check fails |
+
+The deploy job skips itself gracefully until the `SSH_PRIVATE_KEY` secret exists.
+
+### One-time setup (the only manual steps)
+
+1. A deploy keypair already exists at `scripts/deploy/gha_deploy_ed25519` (its
+   public half is installed in the VPS `authorized_keys`; the private half is
+   gitignored on this machine).
+2. Copy the **contents of `scripts/deploy/gha_deploy_ed25519`** (the private
+   key file, including the BEGIN/END lines) into:
+   GitHub → Settings → Secrets and variables → Actions → **New repository
+   secret** → Name: `SSH_PRIVATE_KEY`.
+3. Push to `main` — CI runs, and with the secret present the deploy job ships
+   the release exactly like `scripts/deploy.js ship` did.
+
+To require a human click before production deploys: add a GitHub Environment
+(`production`) with *Required reviewers* and point the deploy job at it via
+`environment: production`.
+
+### Concurrency safety
+
+The deploy job serializes on the `deploy-production` group, so two pushes can
+never deploy at once. Manual `scripts/deploy.js ship` is still possible but
+should be avoided while Actions deploys are enabled — pick one path per change.
+
+## Docker runtime on the VPS (optional, enabled now that the VPS has internet)
+
+The VPS can run the app as a container instead of pm2. MySQL stays on the host
+(the standby/failover design depends on it).
+
+| File | Purpose |
+| --- | --- |
+| `Dockerfile` | multi-stage production image (API + built SPA, non-root) |
+| `docker-compose.yml` | host-networked runtime sharing the pm2 ports, env file, uploads and failover marker |
+| `.github/workflows/docker-publish.yml` | builds + pushes the image to GHCR on `main` (gated by repo variable `PUBLISH_DOCKER=true`) |
+| `scripts/docker/install-docker-vps.sh` | **run with sudo on the VPS** — installs Docker + compose plugin |
+
+### Migration steps (when you decide to switch)
+
+1. On the VPS: `sudo bash ~/install-docker-vps.sh` (installs Docker, adds
+   `feveneyasu` to the docker group — re-login afterwards).
+2. Set the repo variable `PUBLISH_DOCKER=true` → the image publishes to
+   `ghcr.io/abmak/vasperformancetracker:latest` on the next push.
+3. GHCR auth on the VPS (private package): create a fine-grained PAT with
+   `read:packages` → `docker login ghcr.io -u abmak -p <PAT>` — or flip the
+   package to public in GitHub → Packages.
+4. Cutover (on the VPS):
+   `pm2 delete perf-tracking-api && docker compose -f $APP_DIR/docker-compose.yml up -d`
+   (compose file + `scp` it to `$APP_DIR` first). Rollback:
+   `docker compose down && pm2 start perf-tracking-api`.
+5. The Health page keeps working as-is — the container shares the failover
+   marker with the host sync daemon via the mounted `~/mysql-standby` path.

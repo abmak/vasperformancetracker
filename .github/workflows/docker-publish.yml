@@ -1,0 +1,49 @@
+name: Docker publish
+
+# Builds the production image and pushes it to GHCR so the VPS can
+# `docker compose pull` it directly (the VPS now has outbound internet).
+#
+# Gated by the repository VARIABLE PUBLISH_DOCKER=true — set it once Docker
+# is installed on the VPS:
+#   GitHub → Settings → Secrets and variables → Actions → Variables tab
+#   → New repository variable → Name: PUBLISH_DOCKER, Value: true
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: vars.PUBLISH_DOCKER == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/abmak/vasperformancetracker:latest
+            ghcr.io/abmak/vasperformancetracker:${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/abmak/vasperformancetracker:latest
+          cache-to: type=inline

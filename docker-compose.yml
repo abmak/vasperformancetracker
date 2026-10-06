@@ -1,0 +1,56 @@
+# Production runtime for the VAS Performance Tracker on the VPS.
+#
+# Host networking (Linux) keeps everything identical to the pm2 setup:
+#   - the API listens on 127.0.0.1:5001 (vas-https proxies TLS :5000 → it)
+#   - the app reaches the system MySQL at 127.0.0.1:3306 and the standby
+#     failover layer works with the same 127.0.0.1:3307 addresses
+#
+# Prerequisites (one-time):
+#   1. Docker installed:            sudo bash scripts/docker/install-docker-vps.sh
+#   2. GHCR access for the image:   see scripts/DEPLOY.md → "Docker runtime"
+#      (a fine-grained PAT with read:packages, or make the package public)
+#
+# Cutover from pm2 (run on the VPS):
+#   pm2 stop perf-tracking-api && pm2 delete perf-tracking-api
+#   docker compose -f /var/www/performancetracking/app/docker-compose.yml pull
+#   docker compose -f /var/www/performancetracking/app/docker-compose.yml up -d
+# Rollback to pm2 at any time:
+#   docker compose -f /var/www/performancetracking/app/docker-compose.yml down
+#   pm2 start perf-tracking-api
+#
+# NOTE: the failover marker path is shared with the host sync daemon
+# (~/mysql-standby) so the containerized app and the daemon agree on
+# failover state.
+
+name: perf-tracking
+
+services:
+  app:
+    image: ghcr.io/abmak/vasperformancetracker:latest
+    container_name: perf-tracking-app
+    network_mode: host
+    env_file:
+      - /var/www/performancetracking/app/backend/.env.production
+    environment:
+      # Inside the container $HOME is /home/node — pin the marker to the
+      # shared, host-mounted location so failover state is shared.
+      DB_FAILOVER_MARKER: /home/feveneyasu/mysql-standby/FAILOVER
+      PORT: 5001
+    volumes:
+      # persistent user uploads (chat media) + ACME challenges
+      - /var/www/performancetracking/app/backend/uploads:/app/backend/uploads
+      - /var/www/performancetracking/app/backend/acme-challenges:/app/backend/acme-challenges
+      # shared failover marker with the host-side sync daemon
+      - /home/feveneyasu/mysql-standby:/home/feveneyasu/mysql-standby
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5001/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

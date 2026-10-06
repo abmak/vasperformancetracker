@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+frontend/dist
+.git
+.github
+*.log
+backend/uploads
+backend/acme-challenges
+backend/.env
+backend/.env.production
+.env
+.env.production
+scripts
+docs
+*.md
+!README.md

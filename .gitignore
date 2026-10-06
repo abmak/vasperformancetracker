@@ -50,3 +50,4 @@ frontend/vite.config.js.timestamp-*
 CUsersabayneh*
 C*Usersabayneh*
 .freebuff/
+scripts/deploy/gha_deploy_ed25519

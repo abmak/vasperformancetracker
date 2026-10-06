@@ -1,0 +1,190 @@
+name: CI/CD
+
+# CI on every push/PR. Docker is used HERE: a real MySQL 8.0.46 service
+# container (same version as production) runs the backend smoke tests.
+#
+# CD: after CI passes on main, the same tarball protocol as
+# `node scripts/deploy.js ship` ships the release over SSH, health-gates it,
+# and auto-rolls back to the previous release if the app does not come up.
+#
+# The deploy job skips itself gracefully until the SSH_PRIVATE_KEY secret is
+# added in GitHub → Settings → Secrets and variables → Actions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------- backend --
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0.46
+        env:
+          MYSQL_ROOT_PASSWORD: cirootpass
+          MYSQL_DATABASE: vas_revenue_tracking
+          MYSQL_USER: vas_user
+          MYSQL_PASSWORD: civaspass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -prootpass"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+      - name: Syntax-check every source file
+        working-directory: backend
+        run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Smoke test — ensure schema against real MySQL 8
+        working-directory: backend
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_USER: vas_user
+          DB_PASSWORD: civaspass
+          DB_NAME: vas_revenue_tracking
+          JWT_SECRET: ci-secret
+        run: |
+          node -e "require('./src/config/channelDbSetup').ensureChannelSchema().then(()=>{console.log('SCHEMA_OK');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})"
+      - name: Smoke test — boot server and hit /api/health
+        working-directory: backend
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_USER: vas_user
+          DB_PASSWORD: civaspass
+          DB_NAME: vas_revenue_tracking
+          JWT_SECRET: ci-secret
+          PORT: 5050
+        run: |
+          node src/server.js > server.log 2>&1 &
+          for i in $(seq 1 20); do
+            sleep 1
+            if curl -sf http://127.0.0.1:5050/api/health > /tmp/health.json 2>/dev/null; then break; fi
+          done
+          cat /tmp/health.json || { echo 'server never came up'; cat server.log; exit 1; }
+          grep -q '"status":"ok"' /tmp/health.json || { echo 'unhealthy response'; cat server.log; exit 1; }
+          grep -q '"dbTarget":"primary"' /tmp/health.json || { echo 'failover layer not reporting'; exit 1; }
+          echo "SERVER_SMOKE_OK"
+
+  # ------------------------------------------------------------ frontend --
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  # --------------------------------------------------------------- deploy --
+  deploy:
+    needs: [backend, frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      SSH_KEY: /tmp/gha_deploy_key
+      SSH_HOST: 196.189.155.179
+      SSH_USER: feveneyasu
+      APP_DIR: /var/www/performancetracking/app
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for SSH secret (skip gracefully when absent)
+        id: keycheck
+        env:
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            printf '%s\n' "$KEY" > "$SSH_KEY"
+            chmod 600 "$SSH_KEY"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "SSH_PRIVATE_KEY secret not set — deploy skipped. See scripts/DEPLOY.md → 'GitHub Actions CI/CD'."
+          fi
+
+      - name: Setup Node 18
+        if: steps.keycheck.outputs.found == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        if: steps.keycheck.outputs.found == 'true'
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package release artifacts
+        if: steps.keycheck.outputs.found == 'true'
+        run: |
+          tar -czf /tmp/backend.tar.gz backend/src backend/package.json backend/package-lock.json
+          tar -czf /tmp/dist.tar.gz -C frontend dist
+
+      - name: Upload artifacts + deploy helper
+        if: steps.keycheck.outputs.found == 'true'
+        run: |
+          SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20)
+          ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p $APP_DIR/.deploy/incoming"
+          scp "${SSH_OPTS[@]}" /tmp/backend.tar.gz /tmp/dist.tar.gz "$SSH_USER@$SSH_HOST:$APP_DIR/.deploy/incoming/"
+          scp "${SSH_OPTS[@]}" scripts/deploy/remote-deploy.sh "$SSH_USER@$SSH_HOST:$APP_DIR/.deploy/remote-deploy.sh"
+
+      - name: Apply release (remember previous sha for rollback)
+        if: steps.keycheck.outputs.found == 'true'
+        run: |
+          SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+          PREV=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat $APP_DIR/.deploy/CURRENT 2>/dev/null || echo none")
+          echo "PREV=$PREV" >> "$GITHUB_ENV"
+          ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "bash $APP_DIR/.deploy/remote-deploy.sh apply $SHA"
+
+      - name: Health gate (auto-rollback on failure)
+        if: steps.keycheck.outputs.found == 'true'
+        run: |
+          SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+          ok=false
+          for i in $(seq 1 12); do
+            sleep 3
+            if ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" \
+               "curl -sf -m 5 http://127.0.0.1:5001/api/health" \
+               | grep -q '"status":"ok"'; then
+              ok=true; break
+            fi
+          done
+          if [ "$ok" != "true" ]; then
+            echo "::error::Health check failed after deploy — rolling back to $PREV"
+            ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "bash $APP_DIR/.deploy/remote-deploy.sh rollback $PREV"
+            exit 1
+          fi
+          echo "HEALTH_OK — release $SHA is live"
