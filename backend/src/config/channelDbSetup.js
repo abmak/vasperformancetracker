@@ -522,6 +522,21 @@ async function ensureChannelSchema() {
     // caller's account recorded (channel_entities.created_by — the operator
     // who ran the import or filled the registration form). Seeded here so a
     // deploy lights them up in the role editor with no manual script.
+    //
+    // Guard: the permission catalog lives in the BASE tables (permissions,
+    // roles, role_permissions), which are created outside this module. On a
+    // fresh environment (e.g. the CI database) they may not exist yet — the
+    // channel schema itself is still complete, so skip the seeding instead
+    // of failing the whole ensure. Re-run the base setup to enable it.
+    const [basePermTables] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+          AND table_name IN ('permissions', 'roles', 'role_permissions')`
+    );
+    const baseTablesReady = basePermTables[0].n === 3;
+    if (!baseTablesReady) {
+      console.warn('[channelDbSetup] base permission tables (permissions/roles/role_permissions) not present — skipping registry permission seeding');
+    }
     const REGISTRY_PERMISSIONS = [
       { name: 'channel_entities.view',       description: 'View all registered channel data (Entity Registry and reports)',        action: 'view' },
       { name: 'channel_entities.view_own',   description: 'View only channel records recorded by own account',                     action: 'view_own' },
@@ -531,6 +546,7 @@ async function ensureChannelSchema() {
       { name: 'channel_entities.delete_own', description: 'Delete only channel records recorded by own account',                   action: 'delete_own' },
     ];
     for (const p of REGISTRY_PERMISSIONS) {
+      if (!baseTablesReady) break;
       const [ex] = await pool.query('SELECT id FROM permissions WHERE name = ?', [p.name]);
       if (ex.length === 0) {
         await pool.query(
@@ -544,12 +560,14 @@ async function ensureChannelSchema() {
     // registry permissions land in their grants too — the interface reads
     // the token's permission list, and without the grant it would hide the
     // registry from the one account that must always see it.
-    await pool.query(
-      `INSERT IGNORE INTO role_permissions (role_id, permission_id)
-       SELECT r.id, p.id FROM roles r JOIN permissions p
-         ON p.module = 'channel_entities' AND p.section = 'INDIRECT_CHANNEL'
-        WHERE r.scope = 'GLOBAL'`
-    );
+    if (baseTablesReady) {
+      await pool.query(
+        `INSERT IGNORE INTO role_permissions (role_id, permission_id)
+         SELECT r.id, p.id FROM roles r JOIN permissions p
+           ON p.module = 'channel_entities' AND p.section = 'INDIRECT_CHANNEL'
+          WHERE r.scope = 'GLOBAL'`
+      );
+    }
 
     for (const [table, index, definition] of ADDED_INDEXES) {
       await ensureIndex(table, index, definition);
