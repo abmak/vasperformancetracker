@@ -24,6 +24,11 @@ export async function request(endpoint, options = {}) {
   return response.json();
 }
 
+// System health (master admin)
+export const systemAPI = {
+  getHealth: () => request('/system/health'),
+};
+
 // Services
 export const servicesAPI = {
   getAll: () => request('/services'),

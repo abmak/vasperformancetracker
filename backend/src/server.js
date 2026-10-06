@@ -24,6 +24,7 @@ const categoryRoutes = require('./routes/categories');
 const roleRoutes = require('./routes/roles');
 const permissionRoutes = require('./routes/permissions');
 const userRoutes = require('./routes/users');
+const systemRoutes = require('./routes/system');
 const authRoutes = require('./routes/auth');
 const alertRoutes = require('./routes/alerts');
 const smsRoutes = require('./routes/sms');
@@ -105,6 +106,8 @@ app.use('/api/categories', authenticate, categoryRoutes);
 app.use('/api/roles', authenticate, roleRoutes);
 app.use('/api/permissions', authenticate, permissionRoutes);
 app.use('/api/users', authenticate, userRoutes);
+// System health — master admin only (isMasterAdmin enforced inside the router)
+app.use('/api/system', authenticate, systemRoutes);
 app.use('/api/alerts', authenticate, alertRoutes);
 app.use('/api/sms', authenticate, smsRoutes);
 app.use('/api/chat', authenticate, chatRoutes);

@@ -28,6 +28,7 @@ import {
   Eye,
   EyeOff,
   Layers,
+  Activity,
 } from 'lucide-react';
 
 const vasNavItems = [
@@ -77,6 +78,7 @@ const superAdminNavItems = [
   { to: '/admin/users', icon: UserCog, label: 'User Management', permission: 'users.view' },
   { to: '/roles', icon: Shield, label: 'Roles & Permissions', permission: 'roles.view' },
   { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'audit.view' },
+  { to: '/admin/system-health', icon: Activity, label: 'System Health' },
 ];
 
 export default function Layout() {

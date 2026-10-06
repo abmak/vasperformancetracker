@@ -63,6 +63,7 @@ const STANDBY = { host: env.DB_STANDBY_HOST || '127.0.0.1', port: Number(env.DB_
 const MARKER = env.DB_FAILOVER_MARKER || path.join(HOME, 'mysql-standby', 'FAILOVER');
 const LOG_DIR = path.join(HOME, 'mysql-standby', 'log');
 const LOG_FILE = path.join(LOG_DIR, 'sync.log');
+const STATUS_FILE = process.env.DB_SYNC_STATUS_FILE || path.join(HOME, 'mysql-standby', 'status.json');
 const SNAP_DIR = path.join(HOME, 'backups', 'standby-snapshots');
 const INTERVAL_MS = Number(env.DB_SYNC_INTERVAL_MS || 120000);
 const TIMEOUT_MS = Number(env.DB_SYNC_TIMEOUT_MS || 180000);
@@ -204,7 +205,15 @@ async function tableCount(target) {
   return parseInt(res.stdout.toString().trim(), 10) || 0;
 }
 
-// --------------------------------------------------------------- snapshots --
+// --------------------------------------------------------------- status file
+function writeStatusFile(patch) {
+  let cur = {};
+  try { cur = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8')); } catch (e) { /* first run */ }
+  const next = Object.assign({}, cur, patch, { updatedAt: new Date().toISOString() });
+  try { fs.writeFileSync(STATUS_FILE, JSON.stringify(next)); } catch (e) { /* non-fatal */ }
+}
+
+// ---------------------------------------------------------------- snapshots --
 let lastSnapshot = 0;
 async function maybeSnapshot(dumpBuf) {
   const now = Date.now();
@@ -236,19 +245,34 @@ let healthyStreak = 0;
 async function forwardSync() {
   if (fs.existsSync(MARKER)) return failoverCheck(); // race guard: failover happened just now
   if (!(await probe(PRIMARY, 'primary'))) {
+    writeStatusFile({ primaryUp: false, standbyUp: null, lastSyncError: 'primary unreachable' });
     logOnce('fwd-primary', 'primary unreachable — skipping forward sync (standby keeps last good data)');
     return;
   }
   if (!(await probe(STANDBY, 'standby'))) {
+    writeStatusFile({ primaryUp: true, standbyUp: false, lastSyncError: 'standby unreachable' });
     logOnce('fwd-standby', 'standby unreachable — skipping (pm2 should be restarting it)');
     return;
   }
   if (fs.existsSync(MARKER)) return failoverCheck(); // re-check right before touching standby
   const t0 = Date.now();
-  const dump = await dumpFrom(PRIMARY);
-  await restoreTo(STANDBY, dump);
-  log('forward sync ok: ' + Math.round(dump.length / 1024) + ' KB in ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
-  await maybeSnapshot(dump);
+  try {
+    const dump = await dumpFrom(PRIMARY);
+    await restoreTo(STANDBY, dump);
+    writeStatusFile({
+      primaryUp: true,
+      standbyUp: true,
+      lastSyncOk: new Date().toISOString(),
+      lastSyncSeconds: Number(((Date.now() - t0) / 1000).toFixed(1)),
+      lastSyncBytes: dump.length,
+      lastSyncError: null,
+    });
+    log('forward sync ok: ' + Math.round(dump.length / 1024) + ' KB in ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
+    await maybeSnapshot(dump);
+  } catch (e) {
+    writeStatusFile({ primaryUp: true, standbyUp: true, lastSyncError: String(e.message).slice(0, 200) });
+    throw e;
+  }
 }
 
 async function reverseSyncOnce(source, dest, label) {
@@ -262,15 +286,22 @@ async function reverseSyncOnce(source, dest, label) {
 
 async function failoverCheck() {
   if (!fs.existsSync(MARKER)) { healthyStreak = 0; return; }
+  writeStatusFile({ failoverActive: true });
   if (!(await probe(PRIMARY, 'primary'))) {
     healthyStreak = 0;
+    writeStatusFile({ primaryUp: false });
     logOnce('fo-wait', 'FAILOVER ACTIVE — app is served by the standby; primary still down');
     if (!(await probe(STANDBY, 'standby'))) {
+      writeStatusFile({ standbyUp: false });
       logOnce('fo-standby-down', 'CRITICAL: failover active but standby is also unreachable!');
+    } else {
+      writeStatusFile({ standbyUp: true });
     }
     return;
   }
+  writeStatusFile({ primaryUp: true });
   healthyStreak += 1;
+  writeStatusFile({ failbackProbeCount: healthyStreak, failbackProbeRequired: FAILBACK_AFTER_HEALTHY });
   logOnce('fo-healthy', 'primary is back (' + healthyStreak + '/' + FAILBACK_AFTER_HEALTHY + ' healthy probes)');
   if (healthyStreak < FAILBACK_AFTER_HEALTHY) return;
 
@@ -290,8 +321,15 @@ async function failoverCheck() {
     await reverseSyncOnce(STANDBY, PRIMARY, 'failback pass 2 (closes writes made during pass 1)');
     fs.unlinkSync(MARKER);
     healthyStreak = 0;
+    writeStatusFile({
+      failoverActive: false,
+      failbackProbeCount: 0,
+      failbackProbeRequired: FAILBACK_AFTER_HEALTHY,
+      lastFailback: new Date().toISOString(),
+    });
     log('FAILBACK COMPLETE — primary restored and verified (' + cPrimary + ' tables). App will switch back automatically.');
   } catch (e) {
+    writeStatusFile({ lastFailbackError: String(e.message).slice(0, 200) });
     log('FAILBACK failed, will retry next cycle: ' + e.message);
   }
 }
@@ -329,6 +367,7 @@ else if (ONCE) {
 else {
   log('db-sync daemon starting (interval ' + (INTERVAL_MS / 1000) + 's, primary ' +
     PRIMARY.host + ':' + PRIMARY.port + ' → standby ' + STANDBY.host + ':' + STANDBY.port + ')');
+  writeStatusFile({ daemonStartedAt: new Date().toISOString() });
   runCycle().catch(() => {});
   setInterval(() => runCycle().catch(() => {}), INTERVAL_MS);
 }

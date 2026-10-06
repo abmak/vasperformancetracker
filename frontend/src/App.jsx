@@ -26,6 +26,7 @@ import Categories from './pages/Categories';
 import Roles from './pages/Roles';
 import Users from './pages/Users';
 import SuperAdminUsers from './pages/SuperAdminUsers';
+import SystemHealth from './pages/SystemHealth';
 import Alerts from './pages/Alerts';
 import Messages from './pages/Messages';
 import Chat from './pages/Chat';
@@ -54,7 +55,7 @@ function ProtectedRoute({ children }) {
 // The master admin (a GLOBAL-scope role) runs user administration, role/permission
 // management and the audit trail. Every other route redirects to SUPER_ADMIN_HOME.
 const SUPER_ADMIN_HOME = '/admin/users';
-const SUPER_ADMIN_PATHS = [SUPER_ADMIN_HOME, '/roles', '/audit'];
+const SUPER_ADMIN_PATHS = [SUPER_ADMIN_HOME, '/admin/system-health', '/roles', '/audit'];
 
 function SuperAdminScope({ children }) {
   const { isMasterAdmin, user } = useAuth();
@@ -121,6 +122,7 @@ export default function App() {
           {/* Protected routes */}
           <Route element={<ProtectedRoute><SuperAdminScope><Layout /></SuperAdminScope></ProtectedRoute>}>
             <Route path="/admin/users" element={<SuperAdminUsers />} />
+            <Route path="/admin/system-health" element={<SystemHealth />} />
             <Route path="/dashboard" element={<SectionGuard><Dashboard /></SectionGuard>} />
             <Route path="/channel" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelDashboard /></SectionGuard>} />
             <Route path="/channel/registry" element={<SectionGuard sections={['INDIRECT_CHANNEL']}><ChannelRegistry /></SectionGuard>} />
