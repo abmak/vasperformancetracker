@@ -177,6 +177,12 @@ else
 fi
 "$PM2" save
 
+# ------------------------------------------------- phpMyAdmin two servers --
+# Standalone helper so this step can also be run on its own.
+if [ -d /home/feveneyasu/apps/phpmyadmin ]; then
+  bash "$SCRIPT_DIR/pma-two-servers.sh" || log "WARN: phpMyAdmin config update failed (non-fatal)"
+fi
+
 # ------------------------------------------------------- app env + restart -
 if grep -q '^DB_STANDBY_PORT=' "$ENV_FILE"; then
   log "DB_STANDBY_* already present in env file"
