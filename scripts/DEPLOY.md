@@ -113,6 +113,10 @@ production updates — production updates via the GitHub Actions CD pipeline
 
 ## GitHub Actions CI/CD
 
+> **Active since 2026-10-06** — `SSH_PRIVATE_KEY` secret is set; pushes to `main`
+> deploy automatically (health-gated, auto-rollback). Use `scripts/deploy.js ship`
+> only as a fallback and never mix both paths for one change.
+
 `.github/workflows/ci-cd.yml` runs on every push/PR:
 
 | Job | What it does |
