@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   Activity, Server, Database, RefreshCw, CheckCircle2, XCircle, AlertTriangle,
-  Clock, ShieldAlert, ArrowRightLeft, HardDrive,
+  Clock, ShieldAlert, ArrowRightLeft, HardDrive, Gauge, Lock, Archive,
+  History, MemoryStick, HardDriveDownload,
 } from 'lucide-react';
 import { systemAPI } from '../services/api';
 
@@ -23,6 +24,33 @@ function timeAgo(iso, secondsAgo) {
   const h = Math.round(m / 60);
   if (h < 36) return `${h} hr ago`;
   return `${Math.round(h / 24)} days ago`;
+}
+
+function MetricBar({ label, icon: Icon, usedPct, detail, tone }) {
+  const colors = {
+    emerald: { bar: 'bg-emerald-500', text: 'text-emerald-700' },
+    amber: { bar: 'bg-amber-500', text: 'text-amber-700' },
+    red: { bar: 'bg-red-500', text: 'text-red-700' },
+    gray: { bar: 'bg-gray-300', text: 'text-gray-500' },
+  }[tone || 'gray'];
+  return (
+    <div className="rounded-xl border shadow-sm p-4 bg-white">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+          <Icon className="w-4 h-4 text-gray-500" />
+          {label}
+        </div>
+        <span className={`text-sm font-bold ${colors.text}`}>{usedPct == null ? '—' : `${usedPct}%`}</span>
+      </div>
+      <div className="mt-2 h-2 rounded-full bg-gray-100 overflow-hidden">
+        <div
+          className={`h-full rounded-full ${colors.bar} transition-all duration-500`}
+          style={{ width: `${Math.min(100, usedPct == null ? 0 : usedPct)}%` }}
+        />
+      </div>
+      <div className="mt-1.5 text-xs text-gray-500">{detail}</div>
+    </div>
+  );
 }
 
 function StatusCard({ title, icon: Icon, up, sub, tone }) {
@@ -81,7 +109,19 @@ export default function SystemHealth() {
   const target = data?.dbTarget;
   const failoverActive = data?.failover?.active;
   const sync = data?.sync;
+  const server = data?.server;
+  const tls = data?.tls;
+  const backup = data?.backup;
+  const timeline = data?.timeline || [];
   const staleSync = sync?.lastSyncSecondsAgo != null && sync.lastSyncSecondsAgo > 360;
+
+  const diskTone = !server?.disk ? null
+    : server.disk.usedPct >= 85 ? 'red' : server.disk.usedPct >= 70 ? 'amber' : 'emerald';
+  const memTone = !server?.memory ? null
+    : server.memory.usedPct >= 90 ? 'red' : server.memory.usedPct >= 75 ? 'amber' : 'emerald';
+  const tlsTone = !tls ? 'gray'
+    : tls.daysLeft <= 1 ? 'red' : tls.daysLeft <= 2.5 ? 'amber' : 'emerald';
+  const backupTone = !backup ? 'gray' : backup.ok ? 'emerald' : 'red';
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -252,6 +292,101 @@ export default function SystemHealth() {
             />
           </div>
 
+          {/* Server resources + TLS + backup */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+            <MetricBar
+              label="Disk usage"
+              icon={HardDriveDownload}
+              usedPct={server?.disk?.usedPct}
+              tone={diskTone}
+              detail={server?.disk
+                ? `${server.disk.freeGb} GB free of ${server.disk.totalGb} GB`
+                : 'not available on this server'}
+            />
+            <MetricBar
+              label="Memory usage"
+              icon={MemoryStick}
+              usedPct={server?.memory?.usedPct}
+              tone={memTone}
+              detail={server?.memory
+                ? `${server.memory.freeMb} MB free of ${server.memory.totalMb} MB`
+                : 'not available'}
+            />
+            <StatusCard
+              title="TLS certificate"
+              icon={Lock}
+              up={tls ? tls.daysLeft > 2.5 : null}
+              tone={tlsTone}
+              sub={tls ? (
+                <>
+                  <div>expires in <span className="font-bold">{tls.daysLeft} days</span></div>
+                  <div>{new Date(tls.expiresAt).toLocaleString()}</div>
+                  {tls.daysLeft <= 2.5 && (
+                    <div className="text-red-600 font-medium">
+                      renew soon — the external renewal machine must drop the challenge file
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div>certificate probe unavailable</div>
+              )}
+            />
+            <StatusCard
+              title="Nightly backup"
+              icon={Archive}
+              up={backup ? backup.ok : null}
+              tone={backupTone}
+              sub={backup ? (
+                <>
+                  <div>
+                    {backup.newest ? (
+                      <>
+                        newest: {backup.newest.ageHours}h ago · {(backup.newest.sizeBytes / 1024).toFixed(0)} KB
+                      </>
+                    ) : 'none found'}
+                  </div>
+                  <div>{backup.backupCount} backup file(s) kept</div>
+                  {backup.problem && <div className="text-red-600 font-medium">{backup.problem}</div>}
+                </>
+              ) : (
+                <div>backup folder not readable</div>
+              )}
+            />
+          </div>
+
+          {/* Incident timeline */}
+          <div className="rounded-xl border border-gray-200 bg-white p-4">
+            <div className="flex items-center gap-2 text-sm font-semibold text-gray-800 mb-3">
+              <History className="w-4 h-4 text-gray-500" />
+              Incident &amp; sync timeline (latest 20)
+            </div>
+            {timeline.length === 0 ? (
+              <div className="text-xs text-gray-400 py-2">
+                No events recorded yet — sync runs every 2 minutes and will populate this feed.
+              </div>
+            ) : (
+              <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                {timeline.map((e, i) => {
+                  const sev = e.severity || (String(e.type).includes('FAILOVER') || String(e.type).includes('DOWN') ? 'critical' : 'info');
+                  const sevColor = sev === 'critical' ? 'bg-red-500'
+                    : sev === 'warning' ? 'bg-amber-500' : 'bg-emerald-500';
+                  return (
+                    <div key={i} className="flex items-start gap-2.5 text-xs py-1 border-b border-gray-50 last:border-0">
+                      <span className={`mt-1 w-2 h-2 rounded-full shrink-0 ${sevColor}`} />
+                      <div className="min-w-0">
+                        <span className="font-mono text-[10px] text-gray-400 mr-1.5">
+                          {new Date(e.at).toLocaleTimeString()}
+                        </span>
+                        <span className="text-gray-700">{e.message}</span>
+                        <span className="ml-1.5 text-[10px] text-gray-400">({e.source === 'db' ? 'app' : 'daemon'})</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* What this means */}
           <div className="rounded-xl border border-gray-200 bg-white p-4 text-xs text-gray-600 leading-relaxed">
             <span className="font-semibold text-gray-800">How failover works here: </span>
@@ -259,6 +394,7 @@ export default function SystemHealth() {
             If the primary crashes, the next API request switches to the standby instantly — users notice nothing
             after that one request. When the primary is healthy again (2 probes), it is restored <em>from</em> the
             standby so no data written during the outage is lost, and the app switches back automatically.
+            Failover/failback events notify master admins automatically and appear in the timeline above.
             Status refreshes every 15 seconds while this page is open.
           </div>
         </>

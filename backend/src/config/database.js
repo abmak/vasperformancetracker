@@ -109,6 +109,16 @@ function setTarget(name, reason) {
   active = pools[name];
   console.warn('[db-failover] switched to ' + name.toUpperCase() + ' (' + reason + ')');
   writeMarker();
+  // Record the incident + notify master admins (async, best-effort, lazily
+  // required to avoid a circular dependency between the two config modules).
+  try {
+    const { recordFailoverEvent } = require('./dbFailoverEvents');
+    if (name === 'standby') {
+      recordFailoverEvent('FAILOVER_START', 'Primary database became unreachable — app switched to the standby database. Service continues on the standby.', { reason });
+    } else {
+      recordFailoverEvent('FAILOVER_END', 'Primary database is healthy again — app switched back from the standby.', { reason });
+    }
+  } catch (e) { /* event logging must never break the data path */ }
   return true;
 }
 
