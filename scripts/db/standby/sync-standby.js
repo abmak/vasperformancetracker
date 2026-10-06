@@ -162,12 +162,16 @@ function runInput(cmd, args, input, timeoutMs) {
 const q = (s) => '`' + String(s).replace(/`/g, '``') + '`';
 
 function connectArgs(target) {
-  return ['-h', target.host, '-P', String(target.port), '-u', DB_USER, '--connect-timeout=8'];
+  // Callers must prepend '--no-defaults' themselves: ~/.my.cnf on the VPS
+  // points at the primary and would otherwise supply host/user/password to
+  // every spawn we make. (mysqldump only accepts --no-defaults as the very
+  // first argument, so it cannot live inside this helper.)
+  return ['-h', target.host, '-P', String(target.port), '-u', DB_USER];
 }
 
 async function probe(target, label) {
   try {
-    await runCapture('mysql', connectArgs(target).concat(['-e', 'SELECT 1', q(DB_NAME)]), 15000);
+    await runCapture('mysql', ['--no-defaults'].concat(connectArgs(target)).concat(['-e', 'SELECT 1', DB_NAME]), 15000);
     return true;
   } catch (e) {
     logOnce('probe-' + label, label + ' probe failed: ' + String(e.message).split('\n')[0]);
@@ -176,25 +180,26 @@ async function probe(target, label) {
 }
 
 async function dumpFrom(target) {
-  const res = await runCapture('mysqldump', [
+  const res = await runCapture('mysqldump', ['--no-defaults',
     '--single-transaction', '--routines', '--triggers', '--events',
     '--hex-blob', '--no-tablespaces', '--set-gtid-purged=OFF',
     '--add-drop-table', '--default-character-set=utf8mb4',
-  ].concat(connectArgs(target)).concat([q(DB_NAME)]));
+  ].concat(connectArgs(target)).concat([DB_NAME]));
   return res.stdout;
 }
 
 async function restoreTo(target, dumpBuf) {
   const prelude = 'CREATE DATABASE IF NOT EXISTS ' + q(DB_NAME) + ';\nUSE ' + q(DB_NAME) + ';\n';
-  await runInput('mysql', connectArgs(target).concat(['--default-character-set=utf8mb4']),
+  await runInput('mysql', ['--no-defaults'].concat(connectArgs(target))
+    .concat(['--default-character-set=utf8mb4']),
     Buffer.concat([Buffer.from(prelude), dumpBuf]));
 }
 
 async function tableCount(target) {
-  const res = await runCapture('mysql', connectArgs(target).concat([
+  const res = await runCapture('mysql', ['--no-defaults'].concat(connectArgs(target)).concat([
     '-N', '-e',
-    'SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=' +
-      "'" + DB_NAME.replace(/'/g, "\\'") + "'",
+    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='" +
+      DB_NAME.replace(/'/g, "\\'") + "'",
   ]));
   return parseInt(res.stdout.toString().trim(), 10) || 0;
 }
@@ -291,15 +296,16 @@ async function failoverCheck() {
   }
 }
 
-async function cycle() {
+async function runCycle() {
   try {
-    if (STATUS) return printStatus();
     if (fs.existsSync(MARKER)) await failoverCheck();
     else await forwardSync();
   } catch (e) {
     logOnce('cycle-error', 'sync cycle error: ' + e.message);
+    if (ONCE) throw e; // --once callers need the failure reflected in exit code
   }
 }
+
 
 async function printStatus() {
   const p = await probe(PRIMARY, 'primary');
@@ -317,10 +323,12 @@ process.on('uncaughtException', (err) => { log('uncaught exception: ' + (err && 
 process.on('unhandledRejection', (err) => { log('unhandled rejection: ' + (err && (err.stack || err.message) || err)); });
 
 if (STATUS) { printStatus(); }
-else if (ONCE) { cycle().then(() => process.exit(0)).catch((e) => { log('once-mode error: ' + e.message); process.exit(1); }); }
+else if (ONCE) {
+  runCycle().then(() => process.exit(0)).catch((e) => { log('once-mode error: ' + e.message); process.exit(1); });
+}
 else {
   log('db-sync daemon starting (interval ' + (INTERVAL_MS / 1000) + 's, primary ' +
     PRIMARY.host + ':' + PRIMARY.port + ' → standby ' + STANDBY.host + ':' + STANDBY.port + ')');
-  cycle();
-  setInterval(cycle, INTERVAL_MS);
+  runCycle().catch(() => {});
+  setInterval(() => runCycle().catch(() => {}), INTERVAL_MS);
 }

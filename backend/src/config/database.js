@@ -112,25 +112,33 @@ function setTarget(name, reason) {
   return true;
 }
 
-function failoverAndRetry(runOnActive, err, label) {
+function failoverAndRetry(runOnActive, err, label, visited) {
   if (!isConnectionError(err)) throw err;
   const otherName = activeName === 'primary' ? 'standby' : 'primary';
-  if (!setTarget(otherName, err.code + (label ? ' (' + label + ')' : ''))) throw err;
+  // At most one flip per request: if the other target was already tried in
+  // this request, rethrow instead of ping-ponging (e.g. during a total
+  // outage where both targets refuse connections at once).
+  if (!visited || visited.has(otherName) || !setTarget(otherName, err.code + (label ? ' (' + label + ')' : ''))) {
+    throw err;
+  }
+  visited.add(otherName);
   return runOnActive();
 }
 
 // query/execute: transparent passthrough with one retry on the other target.
-function runWithRetryAsync(runOnActive) {
+function runWithRetryAsync(runOnActive, visited) {
+  if (!visited) visited = new Set([activeName]);
   return runOnActive(active).catch((err) =>
-    failoverAndRetry(() => runWithRetryAsync(runOnActive), err)
+    failoverAndRetry(() => runWithRetryAsync(runOnActive, visited), err, undefined, visited)
   );
 }
 
 async function failoverGetConnection() {
+  const visited = new Set([activeName]);
   try {
     return await active.getConnection();
   } catch (err) {
-    return failoverAndRetry(() => active.getConnection(), err, 'getConnection');
+    return failoverAndRetry(() => active.getConnection(), err, 'getConnection', visited);
   }
 }
 
