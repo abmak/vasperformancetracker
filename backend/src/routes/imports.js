@@ -51,46 +51,29 @@ router.post('/preview', requirePermission('import.upload'), upload.single('file'
       if (s.name) serviceMap[s.name.toLowerCase().trim()] = s;
     }
 
-    // Fuzzy match sheet name to VAS service — code first, then name.
-    // A sheet that cannot be matched to a code or a current service name is
-    // left UNMATCHED on purpose: guessing would post revenue under the wrong
-    // service, and an unmatched sheet is visible and fixable instead.
+    // STRICT matching policy (user rule: never guess): a sheet maps to a VAS
+    // service ONLY on an exact match — exact service code, exact service name,
+    // or a whole word of the sheet name that IS a service code. No substring
+    // or word-overlap matching: a sheet named "CRBT" must NOT be silently
+    // posted under "CRBT TONE SALES" just because the name contains "CRBT".
+    // Unmatched sheets surface as invalid rows in the preview instead, so the
+    // data is never attached to the wrong service.
     function matchSheetToService(sheetName) {
       const sLower = sheetName.toLowerCase().trim();
       const cleaned = sLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-      // 1) Exact match on code or name
+      // 1) Exact match on code or name (after normalizing punctuation/spacing)
       if (serviceMap[cleaned]) return serviceMap[cleaned];
       const trimmed = cleaned.replace(/[_\s]+$/, '');
-      if (serviceMap[trimmed]) return serviceMap[trimmed];
+      if (trimmed !== cleaned && serviceMap[trimmed]) return serviceMap[trimmed];
 
-      // 2) A whole word in the sheet name equals (or contains) a service CODE.
-      //    Codes are short and unambiguous — e.g. sheet "API (with MA)" or
-      //    "API-MEGA" carries the code "API"; "Premium SMS MT" carries "MT".
+      // 2) A whole word of the sheet name EQUALS a service CODE, exactly.
+      //    e.g. sheet "API-MEGA" → word "api" == code "API"; sheet
+      //    "CRBT-Partners" → word "crbt" == code "CRBT". Substring matches
+      //    (w.includes(key)) are deliberately NOT accepted.
       const sheetWords = cleaned.split(' ');
       for (const w of sheetWords) {
-        for (const [key, svc] of Object.entries(serviceMap)) {
-          // Only treat the key as a CODE if it is one; name fragments are
-          // handled later and must not win over real code matches.
-          const codeOwner = allServices.find(s => s.code && s.code.toLowerCase().trim() === key);
-          if (!codeOwner) continue;
-          if (w === key || (key.length >= 3 && w.includes(key))) return svc;
-        }
-      }
-
-      // 3) Sheet name contains the full service name or vice versa
-      for (const svc of allServices) {
-        const svcLower = (svc.name || '').toLowerCase().trim();
-        if (svcLower && svcLower.length > 2 && (cleaned.includes(svcLower) || svcLower.includes(cleaned))) return svc;
-      }
-
-      // 4) Word-overlap fallback between sheet and service name (≥60% of the
-      //    service's meaningful words must appear). This maps "National
-      //    Lottery Jul" to "National Lottery" style cases without codes.
-      for (const svc of allServices) {
-        const svcWords = (svc.name || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
-        if (!svcWords.length) continue;
-        const matchCount = svcWords.filter(sw => sheetWords.some(shw => shw.includes(sw) || sw.includes(shw))).length;
-        if (matchCount >= Math.ceil(svcWords.length * 0.6)) return svc;
+        const codeOwner = allServices.find(s => s.code && s.code.toLowerCase().trim() === w);
+        if (codeOwner) return codeOwner;
       }
       return null;
     }
@@ -272,17 +255,20 @@ router.post('/preview', requirePermission('import.upload'), upload.single('file'
         let serviceName = sheetServiceName;
 
         if (!serviceId && partnerName) {
-          // Try matching service type column
+          // Try matching a "Service Type" column — EXACT code or name only
+          // (strict policy: never guess from partial values).
           for (const col of Object.keys(row)) {
             const colLower = col.toLowerCase().trim();
             if (colLower.includes('service') && colLower.includes('type')) {
-              const svcType = String(row[col]).trim();
-              for (const key of Object.keys(serviceMap)) {
-                if (key.includes(svcType.toLowerCase()) || svcType.toLowerCase().includes(key)) {
-                  serviceId = serviceMap[key].id;
-                  serviceName = serviceMap[key].name;
-                  break;
-                }
+              const svcClean = String(row[col]).toLowerCase().trim()
+                .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+              if (!svcClean) break;
+              const svcExact = allServices.find(s =>
+                (s.code && s.code.toLowerCase().trim() === svcClean) ||
+                (s.name && s.name.toLowerCase().trim() === svcClean));
+              if (svcExact) {
+                serviceId = svcExact.id;
+                serviceName = svcExact.name;
               }
               break;
             }
