@@ -32,6 +32,7 @@ import Messages from './pages/Messages';
 import Chat from './pages/Chat';
 import AIAssistant from './pages/AIAssistant';
 import AIUsageReport from './pages/AIUsageReport';
+import UserGuide from './pages/UserGuide';
 
 // Protected route wrapper
 function ProtectedRoute({ children }) {
@@ -146,6 +147,7 @@ export default function App() {
             <Route path="/chat" element={<Chat />} />
             <Route path="/ai" element={<AIAssistant />} />
             <Route path="/ai-usage" element={<AIUsageReport />} />
+            <Route path="/guide" element={<UserGuide />} />
           </Route>
 
           {/* Catch all */}

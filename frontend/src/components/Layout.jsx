@@ -29,6 +29,7 @@ import {
   EyeOff,
   Layers,
   Activity,
+  BookOpen,
 } from 'lucide-react';
 
 const vasNavItems = [
@@ -50,6 +51,7 @@ const vasNavItems = [
   { to: '/import', icon: Upload, label: 'Excel Import', permission: 'import.view' },
   { to: '/reports', icon: FileBarChart, label: 'Reports', permission: 'reports.view' },
   { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'audit.view' },
+  { to: '/guide', icon: BookOpen, label: 'User Guide' },
 ];
 
 const channelNavItems = [
@@ -70,6 +72,7 @@ const channelNavItems = [
   { to: '/users', icon: UserCog, label: 'Users', permission: 'channel_users.view' },
   { to: '/roles', icon: Shield, label: 'Roles', permission: 'channel_roles.view' },
   { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'channel_audit.view' },
+  { to: '/guide', icon: BookOpen, label: 'User Guide' },
 ];
 
 // The master admin runs population administration, role/permission management and
@@ -79,6 +82,7 @@ const superAdminNavItems = [
   { to: '/roles', icon: Shield, label: 'Roles & Permissions', permission: 'roles.view' },
   { to: '/audit', icon: ClipboardList, label: 'Audit Trail', permission: 'audit.view' },
   { to: '/admin/system-health', icon: Activity, label: 'System Health' },
+  { to: '/guide', icon: BookOpen, label: 'User Guide' },
 ];
 
 export default function Layout() {
