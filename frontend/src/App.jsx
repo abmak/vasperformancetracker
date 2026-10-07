@@ -56,7 +56,7 @@ function ProtectedRoute({ children }) {
 // The master admin (a GLOBAL-scope role) runs user administration, role/permission
 // management and the audit trail. Every other route redirects to SUPER_ADMIN_HOME.
 const SUPER_ADMIN_HOME = '/admin/users';
-const SUPER_ADMIN_PATHS = [SUPER_ADMIN_HOME, '/admin/system-health', '/roles', '/audit'];
+const SUPER_ADMIN_PATHS = [SUPER_ADMIN_HOME, '/admin/system-health', '/roles', '/audit', '/guide'];
 
 function SuperAdminScope({ children }) {
   const { isMasterAdmin, user } = useAuth();

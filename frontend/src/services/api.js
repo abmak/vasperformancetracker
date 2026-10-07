@@ -30,6 +30,12 @@ export const systemAPI = {
   controlSync: (action) => request(`/system/sync/${action}`, { method: 'POST' }),
 };
 
+// User Guide content (editable by the super admin)
+export const guideAPI = {
+  get: (section) => request(`/guide/${section}`),
+  save: (section, content) => request(`/guide/${section}`, { method: 'PUT', body: { content } }),
+};
+
 // Services
 export const servicesAPI = {
   getAll: () => request('/services'),

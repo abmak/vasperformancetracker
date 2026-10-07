@@ -35,6 +35,7 @@ const aiRoutes = require('./routes/ai');
 const actionTaskRoutes = require('./routes/actionTasks');
 const goalCascadeRoutes = require('./routes/goalCascade');
 const notificationRoutes = require('./routes/notifications');
+const guideRoutes = require('./routes/guide');
 const channelRoutes = require('./routes/channel');
 const channelImportRoutes = require('./routes/channelImports');
 
@@ -117,6 +118,7 @@ app.use('/api/ai', authenticate, aiRoutes);
 app.use('/api/action-tasks', authenticate, actionTaskRoutes);
 app.use('/api/goal-cascade', authenticate, goalCascadeRoutes);
 app.use('/api/notifications', authenticate, notificationRoutes);
+app.use('/api/guide', authenticate, guideRoutes);
 
 // Indirect Channel section — separate tables, separate route namespace
 app.use('/api/channel/imports', authenticate, channelImportRoutes);

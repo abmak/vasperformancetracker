@@ -1,21 +1,49 @@
-import { useState } from 'react';
-import { useAuth } from '../context/AuthContext';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  BookOpen, LayoutDashboard, Building2, Target, DollarSign, Upload, FileBarChart,
-  Bell, Lightbulb, Bot, Users, Shield, ClipboardList, Layers, Tag, AlertTriangle,
-  CheckCircle2, ChevronRight, Info, Map, UserPlus, Network, Store,
+  BookOpen, DollarSign, Store, Info, AlertTriangle, CheckCircle2, Loader2,
+  Pencil, Save, X, RotateCcw,
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { guideAPI } from '../services/api';
+import toast from 'react-hot-toast';
 
 /* ────────────────────────────────────────────────────────────────────────────
- * User Guide — VAS section + IDC (Indirect Channel) section.
- * Pure documentation: no API calls, safe for every signed-in user.
+ * User Guide — content lives in the `guide_content` table (markdown per
+ * section) and is editable in place by the super admin (master admin).
+ * VAS users see only the VAS guide, IDC users only the channel guide; the
+ * global admin (no section selected) gets both tabs.
  * ──────────────────────────────────────────────────────────────────────────── */
 
-const Box = ({ tone = 'info', title, children }) => {
+const SECTION_META = [
+  { key: 'VAS', label: 'VAS Section', icon: DollarSign },
+  { key: 'INDIRECT_CHANNEL', label: 'IDC — Indirect Channel', icon: Store },
+];
+
+const slugify = (s) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'topic';
+
+/* ── Inline markdown: **bold**, *italic*, `code` ── */
+function renderInline(text, keyBase) {
+  const out = [];
+  const regex = /(\*\*[^*]+\*\*|\*[^*\s][^*]*\*|`[^`]+`)/g;
+  let last = 0, m, k = 0;
+  while ((m = regex.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    const tok = m[0];
+    if (tok.startsWith('**')) out.push(<strong key={`${keyBase}-b${k++}`}>{tok.slice(2, -2)}</strong>);
+    else if (tok.startsWith('`')) out.push(<code key={`${keyBase}-c${k++}`} className="px-1 py-0.5 rounded bg-gray-100 text-[0.85em] font-mono text-gray-800">{tok.slice(1, -1)}</code>);
+    else out.push(<em key={`${keyBase}-i${k++}`}>{tok.slice(1, -1)}</em>);
+    last = m.index + tok.length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+const Callout = ({ tone, children }) => {
   const tones = {
-    info: 'bg-blue-50 border-blue-200 text-blue-900',
     warn: 'bg-amber-50 border-amber-200 text-amber-900',
     ok: 'bg-emerald-50 border-emerald-200 text-emerald-900',
+    info: 'bg-blue-50 border-blue-200 text-blue-900',
   };
   const icon = tone === 'warn'
     ? <AlertTriangle size={16} className="text-amber-600 mt-0.5 shrink-0" />
@@ -23,350 +51,200 @@ const Box = ({ tone = 'info', title, children }) => {
       ? <CheckCircle2 size={16} className="text-emerald-600 mt-0.5 shrink-0" />
       : <Info size={16} className="text-blue-600 mt-0.5 shrink-0" />;
   return (
-    <div className={`border rounded-xl p-4 ${tones[tone]}`}>
-      <div className="flex gap-2">
-        {icon}
-        <div className="text-sm leading-relaxed">
-          {title && <p className="font-semibold mb-1">{title}</p>}
-          {children}
-        </div>
-      </div>
+    <div className={`border rounded-xl p-4 my-2 ${tones[tone]}`}>
+      <div className="flex gap-2 text-sm leading-relaxed">{icon}<div className="space-y-2">{children}</div></div>
     </div>
   );
 };
 
-const Steps = ({ items }) => (
-  <ol className="space-y-2.5 my-3">
-    {items.map((s, i) => (
-      <li key={i} className="flex gap-3">
-        <span className="w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">{i + 1}</span>
-        <div className="text-sm text-gray-700 leading-relaxed">
-          <span className="font-semibold text-gray-900">{s.title}</span>
-          {s.text && <span> — {s.text}</span>}
-        </div>
-      </li>
-    ))}
-  </ol>
-);
+/* ── Block-level markdown → React (headings, lists, quotes, paragraphs) ── */
+function MarkdownBlocks({ text, slugPrefix }) {
+  const lines = (text || '').split(/\r?\n/);
+  const nodes = [];
+  let i = 0, k = 0;
 
-const Bullets = ({ items }) => (
-  <ul className="space-y-1.5 my-2">
-    {items.map((b, i) => (
-      <li key={i} className="flex gap-2 text-sm text-gray-700 leading-relaxed">
-        <div className="w-1.5 h-1.5 rounded-full bg-blue-400 mt-2 shrink-0" />
-        <span>{b}</span>
-      </li>
-    ))}
-  </ul>
-);
+  while (i < lines.length) {
+    const line = lines[i];
 
-const Section = ({ id, icon: Icon, title, children }) => (
-  <section id={id} className="scroll-mt-24 bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-    <div className="flex items-center gap-3 mb-4">
-      <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center">
-        <Icon size={18} />
-      </div>
-      <h2 className="text-lg font-bold text-gray-900">{title}</h2>
-    </div>
-    <div className="space-y-3">{children}</div>
-  </section>
-);
+    if (!line.trim()) { i++; continue; }
 
-/* ── VAS content ─────────────────────────────────────────────────────────── */
+    // Headings inside a topic card (### sub-blocks; ## handled at topic split)
+    let m = line.match(/^###\s+(.*)$/);
+    if (m) {
+      nodes.push(<p key={`h3-${slugPrefix}-${k++}`} className="font-bold text-gray-900 pt-1">{renderInline(m[1], `h3${k}`)}</p>);
+      i++; continue;
+    }
 
-const vasTopics = [
-  { id: 'vas-overview', label: 'Overview', icon: BookOpen },
-  { id: 'vas-dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { id: 'vas-services', label: 'VAS Services', icon: Building2 },
-  { id: 'vas-targets', label: 'Targets & Goals', icon: Target },
-  { id: 'vas-revenue', label: 'Revenue Data', icon: DollarSign },
-  { id: 'vas-import', label: 'Excel Import', icon: Upload },
-  { id: 'vas-partners', label: 'Partner Revenue', icon: Users },
-  { id: 'vas-reports', label: 'Reports & Alerts', icon: FileBarChart },
-  { id: 'vas-actions', label: 'Actions & AI', icon: Bot },
-  { id: 'vas-admin', label: 'Admin Tools', icon: Shield },
-];
+    // Blockquote → callout box (tone from a leading emoji)
+    if (/^>/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      const joined = quoteLines.join('\n').trim();
+      if (joined) {
+        const tone = joined.startsWith('⚠️') ? 'warn' : joined.startsWith('✅') ? 'ok' : 'info';
+        const cleaned = joined.replace(/^[\u26A0\u2705\u2139\uFE0F]+\s*/gu, '').split(/\n{2,}/).map((para) =>
+          para.split('\n').map((l) => l.replace(/^-\s+/, '')).filter(Boolean)
+        );
+        nodes.push(
+          <Callout key={`q-${slugPrefix}-${k++}`} tone={tone}>
+            {cleaned.map((para, pi) => (
+              para.length === 1
+                ? <p key={pi}>{renderInline(para[0], `q${k}-${pi}`)}</p>
+                : <ul key={pi} className="list-disc pl-5 space-y-1">{para.map((li, li2) => <li key={li2}>{renderInline(li, `q${k}-${pi}-${li2}`)}</li>)}</ul>
+            ))}
+          </Callout>
+        );
+      }
+      continue;
+    }
 
-const vasContent = (
-  <>
-    <Section id="vas-overview" icon={BookOpen} title="What the VAS section does">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The VAS section tracks <strong>revenue from Value-Added Services</strong> per partner and per service,
-        compares it against monthly targets, and turns the numbers into reports, alerts and actions. The typical
-        rhythm is: services are defined once, targets are set per month, actual revenue arrives through the Excel
-        Import (or manual entries), and the Dashboard / Reports show how the month is performing.
-      </p>
-      <Bullets items={[
-        'Dashboard — the live month at a glance: revenue vs target per service.',
-        'Excel Import — the main way monthly partner revenue enters the system.',
-        'Reports & Alerts — performance digests and threshold warnings.',
-        'Admin tools — Users, Roles, Audit Trail for section administrators.',
-      ]} />
-    </Section>
+    // Unordered list
+    if (/^-\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^-\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^-\s+/, ''));
+        i++;
+      }
+      nodes.push(
+        <ul key={`ul-${slugPrefix}-${k++}`} className="space-y-1.5 my-2">
+          {items.map((it, ii) => (
+            <li key={ii} className="flex gap-2 text-sm text-gray-700 leading-relaxed">
+              <div className="w-1.5 h-1.5 rounded-full bg-blue-400 mt-2 shrink-0" />
+              <span>{renderInline(it, `ul${k}-${ii}`)}</span>
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
 
-    <Section id="vas-dashboard" icon={LayoutDashboard} title="Dashboard">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The first page you land on. It summarises the selected month: total revenue, total target, achievement
-        percentage, and a per-service breakdown showing which services are on track and which are behind.
-      </p>
-      <Bullets items={[
-        'Use the date/month filter at the top to switch the period you are looking at.',
-        'Click a service to drill into its partner-level numbers.',
-        'Cards update automatically right after a successful import — no refresh needed.',
-      ]} />
-    </Section>
+    // Ordered list
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+\.\s+/, ''));
+        i++;
+      }
+      nodes.push(
+        <ol key={`ol-${slugPrefix}-${k++}`} className="space-y-2.5 my-3">
+          {items.map((it, ii) => (
+            <li key={ii} className="flex gap-3">
+              <span className="w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">{ii + 1}</span>
+              <div className="text-sm text-gray-700 leading-relaxed">{renderInline(it, `ol${k}-${ii}`)}</div>
+            </li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
 
-    <Section id="vas-services" icon={Building2} title="VAS Services">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The registry of billable services (e.g. <em>CRBT Rent</em>, <em>Mobile Terminating</em>, <em>Voice Premium</em>).
-        Every revenue record and every target belongs to one of these services.
-      </p>
-      <Box tone="warn" title="Service names and codes matter — the import matches on them EXACTLY">
-        When you import an Excel file, each <strong>sheet name</strong> is matched to a service using strict exact
-        matching only: the sheet name must equal a service <strong>code</strong>, a service <strong>name</strong>, or
-        contain a whole word that is itself a service code. Partial or fuzzy matches are never guessed.
-        <br /><br />
-        Example: a sheet named <strong>CRBT</strong> will <em>not</em> be posted under <em>CRBT Rent</em> or
-        <em> CRBT Tone Sales</em> — it will be flagged as unmatched so you can decide. If your workbook sheet is
-        named <strong>CRBT</strong>, create a service named exactly <strong>CRBT</strong> (or with code
-        <strong> CRBT</strong>) first, then import.
-      </Box>
-      <Bullets items={[
-        'Keep one service per product; use the code for stable machine-friendly matching.',
-        'Names are what your team sees everywhere; codes are what the importer trusts.',
-        'You can add or edit services any time — historical revenue stays attached to the service it was recorded under.',
-      ]} />
-    </Section>
+    // Paragraph (gather until blank line or a block starter)
+    const para = [];
+    while (
+      i < lines.length && lines[i].trim() &&
+      !/^###{1,3}\s/.test(lines[i]) && !/^>/.test(lines[i]) &&
+      !/^-\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i])
+    ) {
+      para.push(lines[i]); i++;
+    }
+    if (para.length) {
+      nodes.push(<p key={`p-${slugPrefix}-${k++}`} className="text-sm text-gray-700 leading-relaxed">{renderInline(para.join(' '), `p${k}`)}</p>);
+    }
+  }
+  return nodes;
+}
 
-    <Section id="vas-targets" icon={Target} title="Revenue Targets & Goal Cascading">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        Targets are set per <strong>service per month</strong> and are what the achievement percentages are measured
-        against. Goal Cascading lets you break a bigger target down into smaller owned pieces so responsibility is
-        clear.
-      </p>
-      <Steps items={[
-        { title: 'Add a target', text: 'pick the service, the month and the amount (Revenue Targets → Add New Target).' },
-        { title: 'Allocate', text: 'split the target across owners using Target Allocation when needed.' },
-        { title: 'Cascade', text: 'use Goal Cascading to create child goals under a parent target.' },
-      ]} />
-    </Section>
+/* ── Split a markdown doc into topic cards on ## headings ── */
+function splitTopics(md) {
+  const lines = (md || '').split(/\r?\n/);
+  const topics = [];
+  let current = null;
+  const used = new Set();
+  for (const line of lines) {
+    const m = line.match(/^##\s+(.*)$/);
+    if (m) {
+      let slug = slugify(m[1]);
+      while (used.has(slug)) slug = slug + '-x';
+      used.add(slug);
+      current = { title: m[1], slug, lines: [] };
+      topics.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  return topics.map((t) => ({ title: t.title, slug: t.slug, body: t.lines.join('\n').trim() }));
+}
 
-    <Section id="vas-revenue" icon={DollarSign} title="Revenue Data">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        Manual revenue entry and correction. Use it for single adjustments that do not justify a full Excel import —
-        for example a late partner correction or a discovered billing fix.
-      </p>
-      <Bullets items={[
-        'Add Revenue Entry: choose the service, amount, date and optional notes.',
-        'Edit or remove entries later — every change is written to the Audit Trail.',
-        'Bulk monthly data should go through Excel Import instead of manual entry.',
-      ]} />
-    </Section>
-
-    <Section id="vas-import" icon={Upload} title="Excel Import (monthly partner revenue)">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The main pipeline for partner revenue. One workbook, one sheet per VAS service.
-      </p>
-      <Steps items={[
-        { title: 'Prepare the workbook', text: 'name each sheet exactly like the target VAS service (name or code). Sheets like "Premium SMS MT" or "Voice_Premium" match their services automatically.' },
-        { title: 'Upload', text: 'Excel Import → choose the file (.xlsx / .xls / .csv, up to 10MB). A preview is generated — nothing is saved yet.' },
-        { title: 'Review the preview', text: 'each sheet shows how many rows matched and to which service. Sheets that match no service are listed as unmatched with guidance — those rows are NOT imported.' },
-        { title: 'Confirm', text: 'set the revenue month (optional override) and confirm. Valid rows are saved, the Dashboard caches refresh, and the batch appears in the import history.' },
-      ]} />
-      <Box tone="info" title="How sheet names are matched (strict — no guessing)">
-        <Bullets items={[
-          'Exact match: sheet name = service name or service code (punctuation/spacing normalised, case-insensitive).',
-          'Exact word: any whole word of the sheet name that equals a service code — e.g. a sheet "Voice_Export" matches a service coded VOICE via the word "voice".',
-          'Everything else: unmatched. The preview shows the full list of your services so you can fix the sheet name or create the missing service.',
-        ]} />
-      </Box>
-      <Box tone="warn" title="Common pitfalls">
-        <Bullets items={[
-          'A sheet named after a service that does not exist (yet) will be rejected — create the service first.',
-          'One workbook can carry several services; every sheet is handled independently.',
-          'Partner Name and Total Revenue columns are detected automatically; keep one partner per row.',
-          'Re-importing the same file twice creates duplicate revenue — check the import history first.',
-        ]} />
-      </Box>
-    </Section>
-
-    <Section id="vas-partners" icon={Users} title="Partner Revenue">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The record-level view of imported and manual revenue: partner, service, month and amount. Use it to audit
-        what an import actually saved, correct a partner name, or remove a wrong record.
-      </p>
-      <Bullets items={[
-        'Filter by month, service or partner to isolate what you need.',
-        'Edits here are logged to the Audit Trail with your name.',
-      ]} />
-    </Section>
-
-    <Section id="vas-reports" icon={FileBarChart} title="Reports & Alerts">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        <strong>Performance Reports</strong> aggregate revenue vs targets by service and month — the standard pack
-        for management reviews. <strong>Revenue Alerts</strong> raise threshold warnings (e.g. a service far behind
-        its target) so problems surface before month-end.
-      </p>
-      <Bullets items={[
-        'Reports respect the same month filter as the rest of the section.',
-        'Alert rules are configurable; critical alerts also appear as notifications.',
-      ]} />
-    </Section>
-
-    <Section id="vas-actions" icon={Bot} title="Action Notes & AI Assistant">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        <strong>Action Notes</strong> track follow-ups ("call partner X about the August dip") with owners and
-        status. The <strong>VAS AI Assistant</strong> answers questions about your data in plain language — try
-        "which services missed their target last month?". <strong>AI Usage Report</strong> (admins) shows how much
-        the team uses the assistant.
-      </p>
-    </Section>
-
-    <Section id="vas-admin" icon={Shield} title="Admin tools">
-      <Bullets items={[
-        'Users — create accounts and assign them to the VAS section.',
-        'Roles & Permissions — a role grants page-level permissions; users inherit them. Permissions are the gate for every sidebar item.',
-        'Audit Trail — who changed what, when. All imports, edits and deletions land here.',
-        'Categories — configuration for service groupings used by reports.',
-      ]} />
-    </Section>
-  </>
-);
-
-/* ── IDC / Indirect Channel content ──────────────────────────────────────── */
-
-const idcTopics = [
-  { id: 'idc-overview', label: 'Overview', icon: BookOpen },
-  { id: 'idc-dashboard', label: 'Channel Dashboard', icon: LayoutDashboard },
-  { id: 'idc-registry', label: 'Entity Registry', icon: ClipboardList },
-  { id: 'idc-batch', label: 'Batch Import', icon: Upload },
-  { id: 'idc-single', label: 'Single Registration', icon: UserPlus },
-  { id: 'idc-reports', label: 'Channel Reports & Maps', icon: Map },
-  { id: 'idc-admin', label: 'Users, Roles & Audit', icon: Shield },
-];
-
-const idcContent = (
-  <>
-    <Section id="idc-overview" icon={Network} title="What the IDC section does">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The <strong>Indirect Channel (IDC)</strong> section is the register of the indirect-channel network and its
-        trade: who the channel partners are, how they connect to each other, and the stock they hold. Entities are
-        organised as a chain:
-      </p>
-      <div className="flex flex-wrap items-center gap-2 my-3 text-xs font-semibold">
-        <span className="px-3 py-1.5 rounded-lg bg-indigo-100 text-indigo-800">Distributor (Level 1)</span>
-        <ChevronRight size={14} className="text-gray-400" />
-        <span className="px-3 py-1.5 rounded-lg bg-cyan-100 text-cyan-800">Sub-Distributor (Level 2)</span>
-        <ChevronRight size={14} className="text-gray-400" />
-        <span className="px-3 py-1.5 rounded-lg bg-emerald-100 text-emerald-800">Retailer (Level 3)</span>
-      </div>
-      <Bullets items={[
-        'Every entity belongs to a domain — IDC, Yimulu or Enterprise — and reports group them accordingly.',
-        'Each entity gets an identifier code an operator can quote, e.g. IDC-R-0001 for a retailer.',
-        'A Sub-Distributor trades under a Distributor; a Retailer under a Sub-Distributor — the parent is chosen at registration.',
-      ]} />
-    </Section>
-
-    <Section id="idc-dashboard" icon={LayoutDashboard} title="Channel Dashboard">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The landing page for the section: how many entities exist per level and domain, recent registrations, and
-        quick links into the registry and imports. Start here to see the health of the network at a glance.
-      </p>
-    </Section>
-
-    <Section id="idc-registry" icon={ClipboardList} title="Entity Registry">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        The searchable register of every channel entity. What you can do inside depends on your permissions —
-        viewing, editing and deleting are separate grants, and <em>own</em>-scoped variants let users manage only
-        the entities they registered.
-      </p>
-      <Bullets items={[
-        'Search and filter by level, domain, region or status.',
-        'Open an entity to see its profile and its place in the chain (parent links).',
-        'Edits and deletions are permission-gated and written to the Audit Trail.',
-      ]} />
-    </Section>
-
-    <Section id="idc-batch" icon={Upload} title="Batch Import (Excel)">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        Registers or updates many entities at once from one workbook. <strong>Each level has its own sheet layout,
-        and the layout identifies the level</strong> — there is no Category column to fill in. Upload one, two or
-        all three sheets together.
-      </p>
-      <Bullets items={[
-        'Distributor sheet — Distributor Name, Mobile Number, Status, Region, Air Time Type.',
-        'Sub-Distributor sheet — adds the parent Distributor Name / Region / Contact.',
-        'Retailer sheet — adds Existing Business, Geographical Domain, Sub-Distributor link, and optional TIN / Location / National-Fayda ID.',
-      ]} />
-      <Steps items={[
-        { title: 'Download the template', text: 'use the All Levels Template (or a single-level one) so the columns are right from the start.' },
-        { title: 'Fill the sheets', text: 'column headings are matched loosely — common source spellings like "Distributer Region" still work.' },
-        { title: 'Upload and review', text: 'the importer validates rows, flags duplicates and reconciles against the summary sheet before anything is saved.' },
-        { title: 'Confirm', text: 'clean rows are registered; problem rows are listed with the reason so you can fix and re-upload just those.' },
-      ]} />
-      <Box tone="info" title="Stock balance data">
-        The Batch Import page also carries the channel <strong>stock balance</strong> upload: the system validates
-        it, flags duplicates, and reconciles it against the summary sheet the same way.
-      </Box>
-    </Section>
-
-    <Section id="idc-single" icon={UserPlus} title="Single Registration">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        Register one entity at a time through a form that mirrors the batch workbook columns for its level — useful
-        for walk-in registrations and corrections without preparing a file.
-      </p>
-      <Bullets items={[
-        'Pick the level first; the form shows exactly the fields that level needs.',
-        'The parent (Distributor / Sub-Distributor) is picked from existing registered entities.',
-        'Sub-Distributors have no territory or business of their own in the IDC model — the region they trade in identifies them.',
-      ]} />
-    </Section>
-
-    <Section id="idc-reports" icon={Map} title="Channel Reports & Retailer Maps">
-      <p className="text-sm text-gray-700 leading-relaxed">
-        <strong>Channel Reports</strong> show the register spread across the IDC / Yimulu / Enterprise domains,
-        level by level — the chain view makes coverage gaps obvious. The <strong>Retailer Maps</strong> plot the
-        retailer network on the two geographical maps for a visual density check.
-      </p>
-      <Bullets items={[
-        'Filter by domain, region or level to focus the report.',
-        'Registration correctness shows up here first — a retailer linked to the wrong sub-distributor is visible in the chain view.',
-      ]} />
-    </Section>
-
-    <Section id="idc-admin" icon={Shield} title="Users, Roles & Audit">
-      <Bullets items={[
-        'Users — channel-scope accounts (IDC Admin, channel staff).',
-        'Roles — channel permissions are separate from VAS ones; the section admins manage their own.',
-        'Audit Trail — every registration, edit and deletion in the channel register is recorded.',
-      ]} />
-    </Section>
-  </>
-);
-
-/* ── Page shell ──────────────────────────────────────────────────────────── */
-
-const ALL_TABS = [
-  { key: 'vas', label: 'VAS Section', icon: DollarSign, topics: vasTopics, content: vasContent },
-  { key: 'idc', label: 'IDC — Indirect Channel', icon: Store, topics: idcTopics, content: idcContent },
-];
-
+/* ── Page ── */
 export default function UserGuide() {
-  const { user } = useAuth();
-  // Section-aware: a user in the VAS section sees only the VAS guide, an IDC
-  // user only the channel guide. The global admin (no section selected) gets
-  // both tabs, since they administer both sections.
+  const { user, isMasterAdmin } = useAuth();
   const section = user?.section || null;
-  const tabs = section === 'VAS'
-    ? ALL_TABS.filter(t => t.key === 'vas')
-    : section === 'INDIRECT_CHANNEL'
-      ? ALL_TABS.filter(t => t.key === 'idc')
-      : ALL_TABS;
+
+  // Section-aware: VAS users see the VAS guide only, IDC users the channel
+  // guide only; the global admin (no section selected) gets both tabs.
+  const tabs = useMemo(() => {
+    if (section === 'VAS') return SECTION_META.filter((t) => t.key === 'VAS');
+    if (section === 'INDIRECT_CHANNEL') return SECTION_META.filter((t) => t.key === 'INDIRECT_CHANNEL');
+    return SECTION_META;
+  }, [section]);
+
   const [tab, setTab] = useState(tabs[0]?.key);
-  const active = tabs.find(t => t.key === tab) || tabs[0];
+  const [docs, setDocs] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const tabKeys = tabs.map((t) => t.key).join(',');
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setLoadError(null);
+    Promise.all(tabKeys.split(',').map((s) => guideAPI.get(s)))
+      .then((results) => {
+        if (!alive) return;
+        const next = {};
+        for (const r of results) next[r.section] = r;
+        setDocs(next);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setLoadError(e.message);
+        setLoading(false);
+      });
+    return () => { alive = false; };
+  }, [tabKeys]);
+
+  const activeTab = tabs.find((t) => t.key === tab) || tabs[0];
+  const doc = docs[activeTab?.key];
+  const topics = useMemo(() => (doc ? splitTopics(doc.content) : []), [doc]);
+
+  function startEditing() {
+    setDraft(doc?.content || '');
+    setEditing(true);
+  }
+
+  async function saveEditing() {
+    setSaving(true);
+    try {
+      const saved = await guideAPI.save(activeTab.key, draft);
+      setDocs((prev) => ({ ...prev, [activeTab.key]: saved }));
+      setEditing(false);
+      toast.success('User Guide saved');
+    } catch (e) {
+      toast.error(e.message || 'Failed to save the guide');
+    }
+    setSaving(false);
+  }
 
   const subtitle = tabs.length === 1
-    ? (tabs[0].key === 'vas'
+    ? (tabs[0].key === 'VAS'
       ? 'How to use the VAS revenue-tracking section.'
       : 'How to use the IDC (Indirect Channel) section.')
     : 'How to use the VAS revenue-tracking section and the IDC (Indirect Channel) section.';
@@ -375,18 +253,32 @@ export default function UserGuide() {
     <div className="min-h-screen bg-gray-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Header */}
-        <div className="flex items-center gap-3 mb-1">
-          <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center">
-            <BookOpen size={20} />
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center">
+              <BookOpen size={20} />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">User Guide</h1>
+              <p className="text-sm text-gray-500">{subtitle}</p>
+            </div>
           </div>
-          <h1 className="text-2xl font-bold text-gray-900">User Guide</h1>
+
+          {/* Super admin: edit in place */}
+          {isMasterAdmin && !editing && doc && (
+            <button
+              onClick={startEditing}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border border-blue-200 bg-white text-blue-700 hover:bg-blue-50 transition"
+            >
+              <Pencil size={15} /> Edit Guide
+            </button>
+          )}
         </div>
-        <p className="text-sm text-gray-500 mb-6">{subtitle}</p>
 
         {/* Tabs — only shown when more than one section guide is available */}
-        {tabs.length > 1 && (
-          <div className="flex flex-wrap gap-2 mb-6">
-            {tabs.map(t => (
+        {tabs.length > 1 && !editing && (
+          <div className="flex flex-wrap gap-2 mt-5">
+            {tabs.map((t) => (
               <button
                 key={t.key}
                 onClick={() => setTab(t.key)}
@@ -403,31 +295,113 @@ export default function UserGuide() {
           </div>
         )}
 
-        <div className="flex flex-col lg:flex-row gap-6">
-          {/* Topic nav */}
-          <nav className="lg:w-60 shrink-0 lg:sticky lg:top-6 self-start">
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-2 flex flex-row flex-wrap lg:flex-col gap-1">
-              {active.topics.map(t => (
-                <a
-                  key={t.id}
-                  href={`#${t.id}`}
-                  className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700 transition"
-                >
-                  <t.icon size={15} className="text-gray-400 shrink-0" />
-                  {t.label}
-                </a>
-              ))}
-            </div>
-          </nav>
-
-          {/* Content */}
-          <div className="flex-1 space-y-5 min-w-0">
-            {active.content}
-            <p className="text-xs text-gray-400 text-center pt-2">
-              Tip: the sidebar link “User Guide” is available from every page. Last updated October 2026.
-            </p>
+        {loading && (
+          <div className="flex items-center justify-center gap-3 py-20 text-gray-500">
+            <Loader2 size={20} className="animate-spin" /> Loading guide…
           </div>
-        </div>
+        )}
+
+        {loadError && !loading && (
+          <div className="mt-6 bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm">
+            Could not load the guide: {loadError}
+          </div>
+        )}
+
+        {/* Editor (super admin) */}
+        {!loading && !loadError && editing && (
+          <div className="mt-6">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <p className="text-sm text-gray-600">
+                Editing the <strong>{activeTab.label}</strong> guide — markdown supports{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">## headings</code>,{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">- bullets</code>,{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">1. steps</code>,{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">&gt; callout boxes</code>,{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">**bold**</code>,{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">`code`</code>. Each{' '}
+                <code className="px-1 rounded bg-gray-100 text-xs">##</code> heading becomes a topic card with its own sidebar link.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setEditing(false)}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition"
+                  disabled={saving}
+                >
+                  <X size={15} /> Cancel
+                </button>
+                <button
+                  onClick={saveEditing}
+                  disabled={saving || !draft.trim()}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-blue-600 text-white hover:bg-blue-700 transition disabled:opacity-50"
+                >
+                  {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+                  Save Guide
+                </button>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                spellCheck={false}
+                className="w-full h-[65vh] p-4 rounded-2xl border border-gray-300 font-mono text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+                placeholder="Write the guide in markdown…"
+              />
+              <div className="h-[65vh] overflow-y-auto p-5 rounded-2xl border border-gray-200 bg-white space-y-5">
+                {splitTopics(draft).map((t) => (
+                  <section key={t.slug} className="bg-gray-50 rounded-xl border border-gray-100 p-4">
+                    <h3 className="font-bold text-gray-900 mb-2 flex items-center gap-2"><BookOpen size={15} className="text-blue-600" />{t.title}</h3>
+                    <MarkdownBlocks text={t.body} slugPrefix={`prev-${t.slug}`} />
+                  </section>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Read view */}
+        {!loading && !loadError && !editing && doc && (
+          <div className="flex flex-col lg:flex-row gap-6 mt-6">
+            {/* Topic nav */}
+            <nav className="lg:w-60 shrink-0 lg:sticky lg:top-6 self-start">
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-2 flex flex-row flex-wrap lg:flex-col gap-1">
+                {topics.map((t) => (
+                  <a
+                    key={t.slug}
+                    href={`#${t.slug}`}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700 transition"
+                  >
+                    <BookOpen size={15} className="text-gray-400 shrink-0" />
+                    {t.title}
+                  </a>
+                ))}
+              </div>
+            </nav>
+
+            {/* Content */}
+            <div className="flex-1 space-y-5 min-w-0">
+              {topics.map((t) => (
+                <section key={t.slug} id={t.slug} className="scroll-mt-24 bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center">
+                      <BookOpen size={18} />
+                    </div>
+                    <h2 className="text-lg font-bold text-gray-900">{t.title}</h2>
+                  </div>
+                  <div className="space-y-2">
+                    <MarkdownBlocks text={t.body} slugPrefix={t.slug} />
+                  </div>
+                </section>
+              ))}
+              <p className="text-xs text-gray-400 text-center pt-2">
+                {doc.updated_by && doc.updated_at
+                  ? `Last updated by ${doc.updated_by} on ${new Date(doc.updated_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}.`
+                  : 'Built-in guide content.'}
+                {' '}The sidebar link “User Guide” is available from every page.
+              </p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
