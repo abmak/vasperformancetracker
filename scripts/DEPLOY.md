@@ -165,14 +165,19 @@ The VPS can run the app as a container instead of pm2. MySQL stays on the host
 
 1. On the VPS: `sudo bash ~/install-docker-vps.sh` (installs Docker, adds
    `feveneyasu` to the docker group — re-login afterwards).
+   **Done 2026-10-07** — Docker 29.1.3 + compose v2.40.3 installed, service
+   enabled, `docker ps` verified passwordless.
 2. Set the repo variable `PUBLISH_DOCKER=true` → the image publishes to
    `ghcr.io/abmak/vasperformancetracker:latest` on the next push.
 3. GHCR auth on the VPS (private package): create a fine-grained PAT with
    `read:packages` → `docker login ghcr.io -u abmak -p <PAT>` — or flip the
    package to public in GitHub → Packages.
-4. Cutover (on the VPS):
-   `pm2 delete perf-tracking-api && docker compose -f $APP_DIR/docker-compose.yml up -d`
-   (compose file + `scp` it to `$APP_DIR` first). Rollback:
-   `docker compose down && pm2 start perf-tracking-api`.
+4. Cutover (on the VPS): first `docker compose -f $APP_DIR/docker-compose.yml
+   pull` (image must be reachable before anything stops), then `pm2 stop
+   perf-tracking-api` — prefer **stop** over `delete` so the rollback stays a
+   one-liner — then `docker compose -f $APP_DIR/docker-compose.yml up -d`.
+   Verify `curl -s http://127.0.0.1:5001/api/health` shows
+   `"dbTarget":"primary"` and the public `:5000` door still answers.
+   Rollback: `docker compose down && pm2 start perf-tracking-api`.
 5. The Health page keeps working as-is — the container shares the failover
    marker with the host sync daemon via the mounted `~/mysql-standby` path.
