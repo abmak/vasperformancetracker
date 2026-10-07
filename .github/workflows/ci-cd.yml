@@ -116,7 +116,9 @@ jobs:
   # --------------------------------------------------------------- deploy --
   deploy:
     needs: [backend, frontend]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # pm2 deploys are retired while Docker publishing is active — the container
+    # owns port 5001, and a pm2 restart would fight it and fail the health gate.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PUBLISH_DOCKER != 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: deploy-production

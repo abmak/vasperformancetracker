@@ -123,7 +123,7 @@ production updates — production updates via the GitHub Actions CD pipeline
 | --- | --- |
 | `backend` | `npm ci`, syntax-checks every file, boots the API against a real **MySQL 8.0.46 service container** (Docker in CI), runs `ensureChannelSchema` + a `/api/health` smoke test |
 | `frontend` | `npm ci` + production build |
-| `deploy` | on green `main` pushes only: builds, ships the same tarballs over SSH with a **dedicated deploy key**, health-gates the release, **auto-rolls back** to the previous release if the health check fails |
+| `deploy` | on green `main` pushes only: builds, ships the same tarballs over SSH with a **dedicated deploy key**, health-gates the release, **auto-rolls back** to the previous release if the health check fails. **Skipped automatically while `PUBLISH_DOCKER=true`** — releases ship as container images instead |
 
 The deploy job skips itself gracefully until the `SSH_PRIVATE_KEY` secret exists.
 
@@ -162,6 +162,13 @@ The VPS can run the app as a container instead of pm2. MySQL stays on the host
 | `scripts/docker/install-docker-vps.sh` | **run with sudo on the VPS** — installs Docker + compose plugin |
 
 ### Migration steps (when you decide to switch)
+
+> **Done 2026-10-07** — the app runs as the `perf-tracking-app` container
+> (`:latest` + `:7206ca4…`), pm2 `perf-tracking-api` is **stopped but kept** for
+> one-command rollback (`docker compose down && pm2 start perf-tracking-api`),
+> and the CI/CD pm2 deploy job skips itself while `PUBLISH_DOCKER=true`.
+> New releases ship by pushing to `main` → image publishes → `docker compose
+> pull && docker compose up -d` on the VPS.
 
 1. On the VPS: `sudo bash ~/install-docker-vps.sh` (installs Docker, adds
    `feveneyasu` to the docker group — re-login afterwards).
