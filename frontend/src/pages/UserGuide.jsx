@@ -180,7 +180,10 @@ function splitTopics(md) {
 
 /* ── Page ── */
 export default function UserGuide() {
-  const { user, isMasterAdmin } = useAuth();
+  const { user, isMasterAdmin, hasPermission } = useAuth();
+  // Editing the guide needs the guide.edit permission (configurable on the
+  // Roles page); the master admin always passes.
+  const canEdit = isMasterAdmin || hasPermission('guide.edit');
   const section = user?.section || null;
 
   // Section-aware: VAS users see the VAS guide only, IDC users the channel
@@ -264,8 +267,8 @@ export default function UserGuide() {
             </div>
           </div>
 
-          {/* Super admin: edit in place */}
-          {isMasterAdmin && !editing && doc && (
+          {/* Edit in place for holders of guide.edit */}
+          {canEdit && !editing && doc && (
             <button
               onClick={startEditing}
               className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border border-blue-200 bg-white text-blue-700 hover:bg-blue-50 transition"
