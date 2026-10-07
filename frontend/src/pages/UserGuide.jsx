@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useAuth } from '../context/AuthContext';
 import {
   BookOpen, LayoutDashboard, Building2, Target, DollarSign, Upload, FileBarChart,
   Bell, Lightbulb, Bot, Users, Shield, ClipboardList, Layers, Tag, AlertTriangle,
@@ -345,14 +346,30 @@ const idcContent = (
 
 /* ── Page shell ──────────────────────────────────────────────────────────── */
 
-const TABS = [
+const ALL_TABS = [
   { key: 'vas', label: 'VAS Section', icon: DollarSign, topics: vasTopics, content: vasContent },
   { key: 'idc', label: 'IDC — Indirect Channel', icon: Store, topics: idcTopics, content: idcContent },
 ];
 
 export default function UserGuide() {
-  const [tab, setTab] = useState('vas');
-  const active = TABS.find(t => t.key === tab);
+  const { user } = useAuth();
+  // Section-aware: a user in the VAS section sees only the VAS guide, an IDC
+  // user only the channel guide. The global admin (no section selected) gets
+  // both tabs, since they administer both sections.
+  const section = user?.section || null;
+  const tabs = section === 'VAS'
+    ? ALL_TABS.filter(t => t.key === 'vas')
+    : section === 'INDIRECT_CHANNEL'
+      ? ALL_TABS.filter(t => t.key === 'idc')
+      : ALL_TABS;
+  const [tab, setTab] = useState(tabs[0]?.key);
+  const active = tabs.find(t => t.key === tab) || tabs[0];
+
+  const subtitle = tabs.length === 1
+    ? (tabs[0].key === 'vas'
+      ? 'How to use the VAS revenue-tracking section.'
+      : 'How to use the IDC (Indirect Channel) section.')
+    : 'How to use the VAS revenue-tracking section and the IDC (Indirect Channel) section.';
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -364,27 +381,27 @@ export default function UserGuide() {
           </div>
           <h1 className="text-2xl font-bold text-gray-900">User Guide</h1>
         </div>
-        <p className="text-sm text-gray-500 mb-6">
-          How to use the VAS revenue-tracking section and the IDC (Indirect Channel) section.
-        </p>
+        <p className="text-sm text-gray-500 mb-6">{subtitle}</p>
 
-        {/* Tabs */}
-        <div className="flex flex-wrap gap-2 mb-6">
-          {TABS.map(t => (
-            <button
-              key={t.key}
-              onClick={() => setTab(t.key)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border transition ${
-                tab === t.key
-                  ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
-                  : 'bg-white text-gray-700 border-gray-200 hover:border-blue-300 hover:text-blue-700'
-              }`}
-            >
-              <t.icon size={16} />
-              {t.label}
-            </button>
-          ))}
-        </div>
+        {/* Tabs — only shown when more than one section guide is available */}
+        {tabs.length > 1 && (
+          <div className="flex flex-wrap gap-2 mb-6">
+            {tabs.map(t => (
+              <button
+                key={t.key}
+                onClick={() => setTab(t.key)}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border transition ${
+                  tab === t.key
+                    ? 'bg-blue-600 text-white border-blue-600 shadow-sm'
+                    : 'bg-white text-gray-700 border-gray-200 hover:border-blue-300 hover:text-blue-700'
+                }`}
+              >
+                <t.icon size={16} />
+                {t.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="flex flex-col lg:flex-row gap-6">
           {/* Topic nav */}
