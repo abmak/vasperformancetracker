@@ -17,7 +17,12 @@ PC** (`scripts/le/renew.js`, uses `acme-client` + your SSH key):
    `/var/www/performancetracking/app/backend/acme-challenges/`
 3. Let's Encrypt fetches it via `http://196.189.155.179/.well-known/acme-challenge/…`
    — nginx (patched once, `~/acme-nginx-setup.sh` on the VPS) proxies that
-   path to the Express app, which serves the folder (`server.js` route)
+   path to the Express app, which serves the folder (`server.js` route).
+   **Since the Docker cutover (2026-10-08)** the nginx ACME proxy targets
+   `127.0.0.1:5001` (the containerized Express app, plain HTTP) — it used to
+   point at `:5000`, which is now the TLS terminator and returns 502 to plain
+   HTTP (backup at
+   `/etc/nginx/sites-available/vas-ip-redirect.conf.bak-acme-5001`)
 4. Certificate downloaded, pushed to the VPS, installed into `~/vas-tls/`,
    `pm2 restart vas-https`
 
@@ -41,7 +46,8 @@ cd scripts/le && node renew.js
 - VPS side: `~/vas-tls/` (live cert, read by `vas-https` pm2 process),
   `~/vas-tls-le/` (last issued LE cert), `~/acme-nginx-setup.sh` (idempotent
   nginx patch, already applied — backup at
-  `/etc/nginx/sites-available/vas-ip-redirect.conf.bak-acme`)
+  `/etc/nginx/sites-available/vas-ip-redirect.conf.bak-acme`; the installed
+  conf now proxies ACME to `127.0.0.1:5001`, see step 3 above)
 - Port layout: nginx 80/443 → redirect to `https://196.189.155.179:5000`;
   `vas-https` listens 0.0.0.0:5000 (TLS, LE cert) → Express on 127.0.0.1:5001
   (`.env.production` carries `PORT=5001`)
