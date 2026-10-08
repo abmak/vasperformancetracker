@@ -32,16 +32,22 @@ services:
     env_file:
       - /var/www/performancetracking/app/backend/.env.production
     environment:
-      # Inside the container $HOME is /home/node — pin the marker to the
-      # shared, host-mounted location so failover state is shared.
+      # Inside the container $HOME is /home/node — pin these to the shared,
+      # host-mounted locations so the app sees the same state as the host
+      # sync daemon (db-sync) and the host-side backup scripts.
       DB_FAILOVER_MARKER: /home/feveneyasu/mysql-standby/FAILOVER
+      DB_SYNC_STATUS_FILE: /home/feveneyasu/mysql-standby/status.json
+      BACKUPS_DIR: /home/feveneyasu/backups
       PORT: 5001
     volumes:
       # persistent user uploads (chat media) + ACME challenges
       - /var/www/performancetracking/app/backend/uploads:/app/backend/uploads
       - /var/www/performancetracking/app/backend/acme-challenges:/app/backend/acme-challenges
-      # shared failover marker with the host-side sync daemon
+      # shared failover marker + sync status with the host-side sync daemon
       - /home/feveneyasu/mysql-standby:/home/feveneyasu/mysql-standby
+      # backups (nightly dumps + standby snapshots) — read-only, the
+      # System Health page only reads them
+      - /home/feveneyasu/backups:/home/feveneyasu/backups:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5001/api/health"]

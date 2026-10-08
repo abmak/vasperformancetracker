@@ -25,9 +25,12 @@ const { recordFailoverEvent } = require('../config/dbFailoverEvents');
  */
 
 const HOME = os.homedir();
+// Container-aware paths: when the app runs in Docker, $HOME is /home/node and
+// the host dirs are bind-mounted elsewhere — pin them via env in the compose
+// file (see docker-compose.yml).
 const STATUS_FILE = process.env.DB_SYNC_STATUS_FILE
   || path.join(HOME, 'mysql-standby', 'status.json');
-const BACKUPS_DIR = path.join(HOME, 'backups');
+const BACKUPS_DIR = process.env.BACKUPS_DIR || path.join(HOME, 'backups');
 
 function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
