@@ -292,6 +292,35 @@ export default function Roles() {
     });
   }
 
+  // All permission ids currently shown for a group of modules (a section, or the
+  // whole picker) — batch selection operates on exactly what is displayed.
+  function groupPermissionIds(modules) {
+    return modules.flatMap(([, perms]) => perms.map(p => p.id));
+  }
+
+  function toggleSectionAll(modules) {
+    setSectionError('');
+    const ids = groupPermissionIds(modules);
+    const allSelected = ids.length > 0 && ids.every(id => form.permission_ids.includes(id));
+    setForm(prev => ({
+      ...prev,
+      permission_ids: allSelected
+        ? prev.permission_ids.filter(id => !ids.includes(id))
+        : [...new Set([...prev.permission_ids, ...ids])],
+    }));
+  }
+
+  function setAllPermissions(selectAll) {
+    setSectionError('');
+    const ids = displaySections.flatMap(s => groupPermissionIds(s.modules));
+    setForm(prev => ({
+      ...prev,
+      permission_ids: selectAll
+        ? [...new Set([...prev.permission_ids, ...ids])]
+        : prev.permission_ids.filter(id => !ids.includes(id)),
+    }));
+  }
+
   const MODULE_LABELS = {
     dashboard: '📊 Dashboard',
     services: '🏢 VAS Services',
@@ -534,21 +563,59 @@ export default function Roles() {
 
               {/* Permissions */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Permissions ({form.permission_ids.length} selected)
-                </label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Permissions ({form.permission_ids.length} selected)
+                  </label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAllPermissions(true)}
+                      className="text-xs px-2 py-1 rounded bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 transition"
+                    >
+                      Select all
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAllPermissions(false)}
+                      className="text-xs px-2 py-1 rounded bg-gray-50 text-gray-600 border border-gray-200 hover:bg-gray-100 transition"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                </div>
                 <div className="border border-gray-200 rounded-lg divide-y">
                   {displaySections.map((section) => (
                     <div key={section.label}>
                       {/* Section Header */}
-                      <div className="px-3 py-2 bg-gray-50 flex items-center gap-2">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${section.badge}`}>
-                          {section.label}
-                        </span>
-                        <span className="text-[10px] text-gray-400">
-                          {section.modules.length} module{section.modules.length !== 1 ? 's' : ''}
-                        </span>
-                      </div>
+                      {(() => {
+                        const sectionIds = groupPermissionIds(section.modules);
+                        const sectionSelected = sectionIds.filter(id => form.permission_ids.includes(id)).length;
+                        const sectionAll = sectionIds.length > 0 && sectionSelected === sectionIds.length;
+                        const sectionSome = sectionSelected > 0 && !sectionAll;
+                        return (
+                          <div className="px-3 py-2 bg-gray-50 flex items-center gap-2">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${section.badge}`}>
+                              {section.label}
+                            </span>
+                            <span className="text-[10px] text-gray-400">
+                              {section.modules.length} module{section.modules.length !== 1 ? 's' : ''} · {sectionSelected}/{sectionIds.length} selected
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => toggleSectionAll(section.modules)}
+                              className={`ml-auto text-xs px-2 py-0.5 rounded ${
+                                sectionAll ? 'bg-green-100 text-green-700' :
+                                sectionSome ? 'bg-yellow-100 text-yellow-700' :
+                                'bg-white text-gray-500 border border-gray-200'
+                              }`}
+                              title={`Select or clear every permission in ${section.label}`}
+                            >
+                              {sectionAll ? 'All' : sectionSome ? 'Some' : 'None'}
+                            </button>
+                          </div>
+                        );
+                      })()}
                       {/* Modules in this section */}
                       {section.modules.map(([module, perms]) => {
                         const moduleIds = perms.map(p => p.id);
