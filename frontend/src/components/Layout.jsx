@@ -101,6 +101,16 @@ export default function Layout() {
   // Only offer the sections this account is actually allowed to enter
   const canEnter = (section) =>
     !Array.isArray(user?.available_sections) || user.available_sections.includes(section);
+  // Whether the section switcher is offered at all. Beyond the explicit signals
+  // (cross-section user, sections.swap grant, master admin) a MULTI_SECTION role
+  // ("Different Sections") may always move between the sections it belongs to —
+  // the backend swap endpoint already allows it without sections.swap, so the
+  // switcher must not hide once one of its sections is entered.
+  const canSwitchSection =
+    user?.section === null ||
+    isMasterAdmin ||
+    hasPermission('sections.swap') ||
+    (Array.isArray(user?.available_sections) && user.available_sections.length > 1);
   const [sectionMenuOpen, setSectionMenuOpen] = useState(false);
   const [swapping, setSwapping] = useState(false);
 
@@ -346,7 +356,7 @@ export default function Layout() {
               <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
               <span className="text-sm font-semibold tracking-wide text-gray-800">{isGlobalAdmin ? 'User Administration' : isIC ? 'Indirect Channel' : 'VAS Performance Tracker'}</span>
               <span className="text-[10px] font-medium text-green-600 bg-green-50 px-2 py-0.5 rounded-full border border-green-200">LIVE</span>
-              {(user?.section === null || hasPermission('sections.swap') || isMasterAdmin) && (
+              {canSwitchSection && (
                 <>
                   <div className="w-px h-5 bg-gray-300" />
                   <div className="relative">
