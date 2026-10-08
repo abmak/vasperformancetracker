@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Plus, Edit2, Trash2, X, Check, Shield, Users, ChevronDown, ChevronRight, AlertCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { rolesAPI, permissionsAPI } from '../services/api';
@@ -52,6 +52,8 @@ export default function Roles() {
   // (section access with no permissions) can still be edited.
   const [initialSectionAccess, setInitialSectionAccess] = useState([]);
   const [initialPermissionIds, setInitialPermissionIds] = useState([]);
+  // Scrolls the Section Access panel into view when its validation blocks the save.
+  const swapPanelRef = useRef(null);
 
   useEffect(() => { loadData(); }, []);
 
@@ -126,7 +128,13 @@ export default function Roles() {
     // A role that can swap sections needs real access in every section it can reach:
     // at least one section to swap to, and at least one permission inside each of them.
     const sectionsSwapPerm = permissions.find(p => p.name === 'sections.swap');
-    const grantsSwap = isMasterAdmin && !!sectionsSwapPerm && form.permission_ids.includes(sectionsSwapPerm.id);
+    // A multi-section role already owns its sections outright, so sections.swap has
+    // no meaning for it — the swap check (and its UI, which is hidden for this
+    // scope) only applies to the other scopes.
+    const grantsSwap = isMasterAdmin
+      && form.scope !== 'MULTI_SECTION'
+      && !!sectionsSwapPerm
+      && form.permission_ids.includes(sectionsSwapPerm.id);
 
     // Which permission ids belong to a section — read from permissions.section, the
     // authoritative column, rather than inferring it from the module name.
@@ -160,9 +168,10 @@ export default function Roles() {
 
     if (grantsSwap) {
       if (sectionAccess.length === 0) {
-        const message = 'Please choose at least one permission — select at least one section this role can swap to.';
+        const message = 'This role can swap sections (sections.swap) — tick at least one section in the “🔄 Section Access” panel at the bottom of this form.';
         setSectionError(message);
         toast.error(message);
+        swapPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
         return; // do not save
       }
 
@@ -187,13 +196,18 @@ export default function Roles() {
 
     setSaving(true);
     try {
+      // A multi-section role belongs to its sections already; strip the meaningless
+      // sections.swap permission from what is saved so it never blocks or misleads.
+      const payload = form.scope === 'MULTI_SECTION' && sectionsSwapPerm
+        ? { ...form, permission_ids: form.permission_ids.filter(id => id !== sectionsSwapPerm.id) }
+        : form;
       // A multi-section role keeps its sections in the same table the section-access
       // control writes, so for it the role update above is the only writer —
       // clearing here would wipe the sections that were just saved.
       const managesSwapAccess = isMasterAdmin && form.scope !== 'MULTI_SECTION';
 
       if (editingId) {
-        await rolesAPI.update(editingId, form);
+        await rolesAPI.update(editingId, payload);
         // Only the master admin owns section access; for anyone else the update
         // above must stand on its own rather than 403 on an untouched endpoint.
         if (managesSwapAccess) {
@@ -202,7 +216,7 @@ export default function Roles() {
         }
         toast.success('Role updated');
       } else {
-        const newRole = await rolesAPI.create(form);
+        const newRole = await rolesAPI.create(payload);
         // Persist section access for the new role too
         if (managesSwapAccess && grantsSwap) {
           await rolesAPI.setSectionAccess(newRole.id, sectionAccess);
@@ -311,10 +325,14 @@ export default function Roles() {
   // Determine which modules to show based on section
   const isIC = user?.section === 'INDIRECT_CHANNEL';
 
+  // A multi-section role owns its sections outright, so sections.swap is noise —
+  // hide it from the picker instead of letting it trigger the swap-access check.
+  const displayPermGrouped = form.scope === 'MULTI_SECTION' ? withoutSectionSwap(permGrouped) : permGrouped;
+
   // Group modules by the section their permissions declare.
-  const vasModules = Object.entries(permGrouped).filter(([module]) => moduleSection(module) === 'VAS');
-  const icModules = Object.entries(permGrouped).filter(([module]) => moduleSection(module) === 'INDIRECT_CHANNEL');
-  const sharedModules = Object.entries(permGrouped).filter(([module]) => moduleSection(module) === 'SHARED');
+  const vasModules = Object.entries(displayPermGrouped).filter(([module]) => moduleSection(module) === 'VAS');
+  const icModules = Object.entries(displayPermGrouped).filter(([module]) => moduleSection(module) === 'INDIRECT_CHANNEL');
+  const sharedModules = Object.entries(displayPermGrouped).filter(([module]) => moduleSection(module) === 'SHARED');
 
   // Build the display list based on section
   let displaySections = [];
@@ -591,7 +609,7 @@ export default function Roles() {
               {/* Section Access — master admin only, and only when this role is granted sections.swap. A
                   multi-section role already owns its sections, so it does not need this control. */}
               {isMasterAdmin && form.scope !== 'MULTI_SECTION' && form.permission_ids.includes(permissions.find(p => p.name === 'sections.swap')?.id) && (
-                <div className={`mt-4 p-4 border rounded-lg ${sectionError ? 'bg-red-50 border-red-300' : 'bg-purple-50 border-purple-200'}`}>
+                <div ref={swapPanelRef} className={`mt-4 p-4 border rounded-lg ${sectionError ? 'bg-red-50 border-red-300' : 'bg-purple-50 border-purple-200'}`}>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     🔄 Section Access — Which sections can this role swap to?
                   </label>

@@ -217,9 +217,20 @@ router.post('/', requirePermission('roles.create', 'channel_roles.create'), asyn
       [name, description || null, is_default ? 1 : 0, resolved.scope]
     );
     
+    // sections.swap is meaningless for a multi-section role — it already belongs to
+    // its sections — so strip it instead of storing a permission that cannot work
+    // (the Roles UI hides it for this scope; this is the enforcement behind it).
+    let permsToSave = permission_ids;
+    if (resolved.scope === 'MULTI_SECTION' && Array.isArray(permsToSave) && permsToSave.length > 0) {
+      const [swapPerm] = await pool.query("SELECT id FROM permissions WHERE name = 'sections.swap'");
+      if (swapPerm.length > 0) {
+        permsToSave = permsToSave.filter(id => id !== swapPerm[0].id);
+      }
+    }
+
     // Assign permissions
-    if (permission_ids && permission_ids.length > 0) {
-      for (const pid of permission_ids) {
+    if (permsToSave && permsToSave.length > 0) {
+      for (const pid of permsToSave) {
         await pool.query('INSERT IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)', [result.insertId, pid]);
       }
     }
@@ -274,11 +285,19 @@ router.put('/:id', requirePermission('roles.edit', 'channel_roles.edit'), async 
       [name, description || null, is_default ? 1 : 0, resolved.scope, req.params.id]
     );
     
-    // Update permissions: delete all, re-insert
+    // Update permissions: delete all, re-insert (sections.swap stripped for
+    // multi-section roles — see the create route for why).
     if (permission_ids !== undefined) {
+      let permsToSave = permission_ids;
+      if (resolved.scope === 'MULTI_SECTION' && Array.isArray(permsToSave) && permsToSave.length > 0) {
+        const [swapPerm] = await pool.query("SELECT id FROM permissions WHERE name = 'sections.swap'");
+        if (swapPerm.length > 0) {
+          permsToSave = permsToSave.filter(id => id !== swapPerm[0].id);
+        }
+      }
       await pool.query('DELETE FROM role_permissions WHERE role_id = ?', [req.params.id]);
-      if (permission_ids.length > 0) {
-        for (const pid of permission_ids) {
+      if (permsToSave.length > 0) {
+        for (const pid of permsToSave) {
           await pool.query('INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?)', [req.params.id, pid]);
         }
       }
