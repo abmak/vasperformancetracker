@@ -117,3 +117,48 @@ docker logs --tail 50 pg-primary
   `replication` block (state, lag bytes/seconds, `standbyInRecovery`).
 - **MySQL** is still on the host for rollback; its `mysqldump` cron and the
   `db-sync` daemon keep running until PostgreSQL has proven itself.
+
+## Production state (cut over 2026-10-14, commit `4ffe4f9`)
+
+The VPS now runs on PostgreSQL. Live layout:
+
+```
+/var/www/performancetracking/pg/docker-compose.pg.yml   the primary + standby
+/var/www/performancetracking/pg/.env.pg                 generated secrets (600)
+/var/www/performancetracking/pg/scripts/db/…            migration + ops scripts
+/home/feveneyasu/pg-standby/                            FAILOVER / PROMOTED markers
+/home/feveneyasu/backups/vas-pg-<date>.sql.gz           nightly pg_dump (cron 02:15)
+```
+
+Migration result: **45/45 tables, every row count identical to MySQL**
+(users 9, roles 12, permissions 83, role_permissions 427, partner_revenue 515,
+channel_entities 57, audit_trail 899). 30 API endpoints (VAS dashboard, reports,
+partners, targets, revenue, actions, audit, roles, users, chat, guide, and the
+whole Indirect Channel surface) all returned 200 through the app on PostgreSQL,
+plus a real write (replication pause → resume, both events recorded).
+
+**Gotcha:** `~/.my.cnf` on the VPS holds a *stale* password for `vas_user` — the
+mysql client works, mysql2 does not. Use the credentials in
+`backend/.env.production` (the ones the app itself uses) when re-running the
+migration.
+
+**Rollback** (any time during the MySQL window):
+
+```bash
+docker compose -f /var/www/performancetracking/app/docker-compose.yml down
+cp ~/backups/env.production.pre-pg-<stamp> /var/www/performancetracking/app/backend/.env.production
+docker tag ghcr.io/abmak/vasperformancetracker:pre-pg-20261014 ghcr.io/abmak/vasperformancetracker:latest
+docker compose -f /var/www/performancetracking/app/docker-compose.yml up -d
+# MySQL never stopped, so this restores the previous behaviour immediately
+```
+
+**Follow-ups worth knowing:**
+
+- Root filesystem is ~91% full (2.1 GB free) after adding the PG stack; watch it.
+- There is deliberately **no replication slot** for the standby: if the standby
+  is down long enough for the primary to recycle WAL it needs a re-clone
+  (`pg-setup-replication.sh --force`) rather than a restart.
+- The old `~/mysql-standby` mount and the pm2 `db-sync` daemon remain for the
+  MySQL rollback window; nothing in the app depends on them any more.
+- `scripts/db/check-pg-tables.js` still contains a hard-coded local password and
+  is a local-only debugging aid.
