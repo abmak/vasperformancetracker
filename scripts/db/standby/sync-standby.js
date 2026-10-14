@@ -34,8 +34,13 @@ const path = require('path');
 const zlib = require('zlib');
 
 const HOME = os.homedir();
+// This daemon copies MySQL; the app's env file describes PostgreSQL, so pointing
+// it there silently aims mysqldump at the wrong server (it did, until the
+// restart that reloaded the file). Prefer a daemon-local env when one exists and
+// fall back to the app env only on a host that has not been migrated.
+const LOCAL_ENV_FILE = path.join(HOME, 'mysql-standby', 'mysql.env');
 const ENV_FILE = process.env.STANDBY_ENV_FILE
-  || '/var/www/performancetracking/app/backend/.env.production';
+  || (fs.existsSync(LOCAL_ENV_FILE) ? LOCAL_ENV_FILE : '/var/www/performancetracking/app/backend/.env.production');
 
 function loadEnvFile(file) {
   const out = {};
