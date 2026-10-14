@@ -229,9 +229,24 @@ function tlsCertExpiry() {
 }
 
 // -------------------------------------------------------------- backups ----
-// Nightly backups are now pg_dump archives (vas-pg-<date>.sql.gz). The legacy
-// MySQL names are still listed so the card keeps working during the MySQL
-// rollback window instead of flashing "no backups found".
+// PostgreSQL dumps run in three tiers from one script (scripts/db/pg-backup.sh),
+// each with its own retention, so there is always a restore point that is
+// minutes, hours and days old:
+//
+//   vas-pg-10m-<date>-<HHMM>.sql.gz    every 10 min   keep newest 6  (last hour)
+//   vas-pg-hourly-<date>-<HH>.sql.gz   hourly         keep newest 24 (last day)
+//   vas-pg-<date>.sql.gz               nightly        keep 14 days
+//
+// The legacy MySQL names (vas-<date>.sql.gz) are still counted so the card keeps
+// working during the MySQL rollback window instead of flashing "no backups".
+const BACKUP_TIERS = [
+  // key, name prefix/pattern, label, and how stale the tier may get before it
+  // counts as broken (a missed 10-minute run must not hide in a green card).
+  { key: 'tenMin', match: (n) => n.startsWith('vas-pg-10m-'), label: 'every 10 min', maxAgeHours: 0.5 },
+  { key: 'hourly', match: (n) => n.startsWith('vas-pg-hourly-'), label: 'hourly', maxAgeHours: 2 },
+  { key: 'nightly', match: (n) => /^vas-pg-\d{4}-\d{2}-\d{2}\.sql\.gz$/.test(n), label: 'nightly', maxAgeHours: 26 },
+];
+
 function backupCheck() {
   try {
     const files = fs.readdirSync(BACKUPS_DIR)
@@ -242,17 +257,61 @@ function backupCheck() {
       })
       .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
     if (!files.length) return { configured: true, ok: false, problem: 'no vas-pg-*.sql.gz backups found in ~/backups' };
-    const newest = files[0];
-    const ageHours = Number(((Date.now() - Date.parse(newest.mtime)) / 3600000).toFixed(1));
+
+    const now = Date.now();
+    const ageHoursOf = (f) => (now - Date.parse(f.mtime)) / 3600000;
     // <1KB gzip ≈ empty dump (the old cron bug — spaces-privilege issue)
-    const looksEmpty = newest.sizeBytes < 1000;
+    const empty = (f) => f.sizeBytes < 1000;
+
+    // files are newest-first, so [0] of each tier is that tier's newest dump.
+    const tiers = {};
+    for (const t of BACKUP_TIERS) {
+      const own = files.filter((f) => t.match(f.name));
+      const newestOfTier = own[0] || null;
+      const ageHours = newestOfTier ? Number(ageHoursOf(newestOfTier).toFixed(2)) : null;
+      tiers[t.key] = {
+        label: t.label,
+        count: own.length,
+        newest: newestOfTier && {
+          name: newestOfTier.name,
+          sizeBytes: newestOfTier.sizeBytes,
+          ageHours,
+          mtime: newestOfTier.mtime,
+        },
+        // Each tier stands on its own: a fresh 10-minute dump cannot make a
+        // nightly tier that stopped days ago look healthy.
+        ok: newestOfTier ? ageHours < t.maxAgeHours && !empty(newestOfTier) : false,
+      };
+    }
+
+    const newest = files[0];
+    const ageHours = Number(ageHoursOf(newest).toFixed(1));
+    const looksEmpty = empty(newest);
+    // The card's light tracks the nightly dump when there is one, because that
+    // is the copy of last resort; otherwise it falls back to the newest file.
+    const safety = tiers.nightly.newest
+      ? files.find((f) => f.name === tiers.nightly.newest.name)
+      : newest;
+    const safetyAgeHours = Number(ageHoursOf(safety).toFixed(1));
+    const safetyEmpty = empty(safety);
+    // An empty (<1KB) dump is a broken dump, not merely an old one: it is worth
+    // naming even when it sits in a tier other than the nightly one, because
+    // that tier would otherwise quietly keep handing back six useless files.
+    // files are newest-first, so find() names the most recent bad dump.
+    const firstEmpty = (files.find(empty) || {}).name || null;
+
     return {
       configured: true,
-      ok: ageHours < 26 && !looksEmpty,
+      // Green only when the nightly copy of last resort is fresh and readable;
+      // per-tier detail lives in `tiers` so this light stays meaningful.
+      ok: safetyAgeHours < 26 && !safetyEmpty,
       newest: { name: newest.name, sizeBytes: newest.sizeBytes, ageHours, mtime: newest.mtime },
       backupCount: files.length,
       engine: newest.name.startsWith('vas-pg-') ? 'postgres' : 'mysql',
-      problem: looksEmpty ? 'newest backup looks empty (<1KB)' : ageHours >= 26 ? 'no fresh backup in 26h' : null,
+      tiers,
+      problem: firstEmpty
+        ? `empty dump: ${firstEmpty} (<1KB)`
+        : safetyAgeHours >= 26 ? 'no fresh backup in 26h' : null,
     };
   } catch (e) {
     // Dev machines have no ~/backups — neutral state, not an error.

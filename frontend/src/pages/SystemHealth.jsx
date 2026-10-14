@@ -211,7 +211,7 @@ export default function SystemHealth() {
           <Info className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
           <div className="text-xs text-blue-800">
             <span className="font-semibold">Development environment.</span> The standby database, streaming
-            replication, TLS certificate and nightly backups live on the production VPS — the cards below reflect
+            replication, TLS certificate and tiered backups live on the production VPS — the cards below reflect
             this machine only. Open the production app (https://196.189.155.179:5000) for the full picture.
           </div>
         </div>
@@ -462,22 +462,39 @@ export default function SystemHealth() {
               )}
             />
             <StatusCard
-              title="Nightly backup"
+              title={backup?.tiers ? `Backups (${Object.keys(backup.tiers).length} tiers)` : 'Nightly backup'}
               icon={Archive}
               up={devMode || !backup || backup.ok == null ? null : backup.ok}
               tone={devMode ? 'gray' : backupTone}
               sub={devMode ? (
-                <div>Nightly backups are stored on the production VPS (~/backups)</div>
+                <div>Tiered backups are stored on the production VPS (~/backups)</div>
               ) : backup ? (
                 <>
-                  <div>
-                    {backup.newest ? (
-                      <>
-                        newest: {backup.newest.ageHours}h ago · {(backup.newest.sizeBytes / 1024).toFixed(0)} KB
-                      </>
-                    ) : 'none found'}
-                  </div>
-                  <div>{backup.backupCount} backup file(s) kept</div>
+                  {backup.tiers ? (
+                    // Each tier is reported on its own so a healthy 10-minute
+                    // tier cannot make a stale nightly tier look fine.
+                    <div className="space-y-0.5">
+                      {[['tenMin', '10 min'], ['hourly', 'hourly'], ['nightly', 'nightly']].map(([key, label]) => {
+                        const tier = backup.tiers[key];
+                        if (!tier) return null;
+                        return (
+                          <div key={key} className="flex items-center justify-between gap-2">
+                            <span className="text-gray-500">{label}</span>
+                            <span className={tier.ok ? 'text-gray-700' : 'text-red-600 font-medium'}>
+                              {tier.newest ? timeAgo(tier.newest.mtime) : 'none'} · {tier.count} kept
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div>
+                      {backup.newest
+                        ? `newest: ${backup.newest.ageHours}h ago · ${(backup.newest.sizeBytes / 1024).toFixed(0)} KB`
+                        : 'none found'}
+                    </div>
+                  )}
+                  <div>{backup.backupCount} backup file(s) kept in ~/backups</div>
                   {backup.problem && <div className="text-red-600 font-medium">{backup.problem}</div>}
                 </>
               ) : (

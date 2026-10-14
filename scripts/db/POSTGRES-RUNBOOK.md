@@ -21,7 +21,7 @@ during the rollback window.
 | `scripts/db/pg-setup-replication.sh` | clones the primary into the standby (`pg_basebackup`) and starts streaming |
 | `scripts/db/migrate-mysql-to-postgres.js` | one-shot data migration (45 tables, verified row counts) |
 | `scripts/db/setup-postgres-functions.js`<br>`scripts/db/setup-postgres-compat-layer.js` | MySQL-compat functions/operators the legacy SQL relies on (needs superuser) |
-| `scripts/db/pg-backup.sh` | nightly `pg_dump` → `~/backups/vas-pg-<date>.sql.gz` (+ retention) |
+| `scripts/db/pg-backup.sh` | tiered `pg_dump` → `~/backups/vas-pg*.sql.gz` (10-min / hourly / nightly + retention) |
 
 Secrets live in `.env.pg` next to the compose file (chmod 600):
 
@@ -85,19 +85,41 @@ old primary's data can be discarded.
 
 ## Backups & restore
 
+One script, three tiers — they differ only in how often they run and how many
+are kept, so there is always a restore point that is minutes, hours and days old:
+
+| Tier | Runs | File | Kept | Recovers from |
+| --- | --- | --- | --- | --- |
+| 10-minute | `*/10 * * * *` | `vas-pg-10m-<date>-<HHMM>.sql.gz` | newest 6 (1 hour) | a mistake made minutes ago |
+| hourly | `5 * * * *` | `vas-pg-hourly-<date>-<HH>.sql.gz` | newest 24 (1 day) | something noticed later today |
+| nightly | `15 2 * * *` | `vas-pg-<date>.sql.gz` | 14 days | anything from the past fortnight |
+
 ```bash
-bash scripts/db/pg-backup.sh                 # manual run
-crontab -e                                   # 15 2 * * * … (see script header)
+bash scripts/db/pg-backup.sh --tier=10m      # manual run of one tier
+bash scripts/db/pg-backup.sh                 # no argument = nightly (as before)
+crontab -l                                   # */10, 5 * * *, 15 2 * * *
 ```
 
-Restore (into a rebuilt/empty cluster):
+Steady-state footprint is small: each dump is ~2.1 MB, so 6 + 24 + 14 files ≈
+95 MB. Retention is per tier, and the nightly `-mtime` prune is scoped to
+`vas-pg-YYYY-MM-DD` names so it can never sweep away the shorter tiers.
+
+The script picks whichever container is **out of recovery**, so a backup taken
+after a failover comes from the promoted standby rather than the old primary
+(dumping a read-only replica would produce a file that looks fresh but is
+stale). If no writable server is found it exits non-zero and writes nothing. A
+`flock` guard means a slow dump is skipped rather than stacked.
+
+Restore (into a rebuilt/empty cluster) — pick the tier by how far back you need:
 
 ```bash
-gunzip -c ~/backups/vas-pg-2026-10-14.sql.gz | docker exec -i pg-primary psql -U postgres -d vas_revenue_tracking
+ls -t ~/backups/vas-pg-hourly-*.sql.gz | head -1                  # newest hourly
+ls -t ~/backups/vas-pg-hourly-*.sql.gz | head -1 | xargs -I{} gunzip -c {} \
+  | docker exec -i pg-primary psql -U postgres -d vas_revenue_tracking
 ```
 
-Nightly dumps in plain SQL, `--no-owner --clean --if-exists`, so they restore
-into a cluster with different role names and drop/recreate objects cleanly.
+Dumps are plain SQL, `--no-owner --clean --if-exists`, so they restore into a
+cluster with different role names and drop/recreate objects cleanly.
 
 ## Operations
 
@@ -127,7 +149,9 @@ The VPS now runs on PostgreSQL. Live layout:
 /var/www/performancetracking/pg/.env.pg                 generated secrets (600)
 /var/www/performancetracking/pg/scripts/db/…            migration + ops scripts
 /home/feveneyasu/pg-standby/                            FAILOVER / PROMOTED markers
-/home/feveneyasu/backups/vas-pg-<date>.sql.gz           nightly pg_dump (cron 02:15)
+/home/feveneyasu/backups/vas-pg-10m-*.sql.gz           10-minute pg_dump (keep 6)
+/home/feveneyasu/backups/vas-pg-hourly-*.sql.gz        hourly pg_dump (keep 24)
+/home/feveneyasu/backups/vas-pg-<date>.sql.gz          nightly pg_dump (cron 02:15, keep 14d)
 ```
 
 Migration result: **45/45 tables, every row count identical to MySQL**
@@ -154,7 +178,9 @@ docker compose -f /var/www/performancetracking/app/docker-compose.yml up -d
 
 **Follow-ups worth knowing:**
 
-- Root filesystem is ~91% full (2.1 GB free) after adding the PG stack; watch it.
+- Root filesystem is ~91% full (2.0 GB free) after adding the PG stack; watch it.
+  The tiered dumps add ~95 MB steady state on the same filesystem the database
+  lives on, so a full disk takes the backups down with the cluster.
 - There is deliberately **no replication slot** for the standby: if the standby
   is down long enough for the primary to recycle WAL it needs a re-clone
   (`pg-setup-replication.sh --force`) rather than a restart.
