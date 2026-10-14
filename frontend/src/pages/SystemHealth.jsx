@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import toast from 'react-hot-toast';
 import {
   Activity, Server, Database, RefreshCw, CheckCircle2, XCircle, AlertTriangle,
-  Clock, ShieldAlert, ArrowRightLeft, HardDrive, Gauge, Lock, Archive,
-  History, MemoryStick, HardDriveDownload, Info, Camera, Pause, Play,
+  Clock, ShieldAlert, ArrowRightLeft, HardDrive, Gauge, Lock, Archive, Timer,
+  History, MemoryStick, HardDriveDownload, Info, Pause, Play,
   ListChecks,
 } from 'lucide-react';
 import { systemAPI } from '../services/api';
@@ -13,7 +13,8 @@ import { systemAPI } from '../services/api';
  *
  * Shows which database the app is currently serving from (primary/standby),
  * liveness of both PostgreSQL instances, streaming replication state (a standby
- * is read-only until it is promoted) and the nightly pg_dump backup.
+ * is read-only until it is promoted) and the three tiered pg_dump backups
+ * (10-minute, hourly, nightly) — one card per tier.
  * Data from GET /api/system/health.
  */
 
@@ -76,6 +77,63 @@ function StatusCard({ title, icon: Icon, up, sub, tone }) {
         {up == null && <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${map.chip}`}>N/A</span>}
       </div>
       <div className="mt-2 text-xs text-gray-600">{sub}</div>
+    </div>
+  );
+}
+
+/**
+ * Accent per backup tier: the three cadences are visually distinct, while a
+ * broken tier still turns red and an unknown one stays neutral — so the colour
+ * never claims more than the light does.
+ */
+const TIER_COLORS = {
+  tenMin: { border: 'border-sky-200', bg: 'bg-sky-50', icon: 'text-sky-600', chip: 'bg-sky-100 text-sky-700' },
+  hourly: { border: 'border-violet-200', bg: 'bg-violet-50', icon: 'text-violet-600', chip: 'bg-violet-100 text-violet-700' },
+  nightly: { border: 'border-emerald-200', bg: 'bg-emerald-50', icon: 'text-emerald-600', chip: 'bg-emerald-100 text-emerald-700' },
+  red: { border: 'border-red-200', bg: 'bg-red-50', icon: 'text-red-600', chip: 'bg-red-100 text-red-700' },
+  gray: { border: 'border-gray-200', bg: 'bg-gray-50', icon: 'text-gray-400', chip: 'bg-gray-100 text-gray-500' },
+};
+
+// One card per cadence, mirroring the retention in scripts/db/pg-backup.sh.
+const BACKUP_TIER_CARDS = [
+  { key: 'tenMin', title: '10-minute backup', icon: Timer, accent: 'tenMin', retention: 'last hour (6)' },
+  { key: 'hourly', title: 'Hourly backup', icon: Clock, accent: 'hourly', retention: 'last day (24)' },
+  { key: 'nightly', title: 'Nightly backup', icon: Archive, accent: 'nightly', retention: 'last 14 days' },
+];
+
+/**
+ * BackupTierCard — one backup tier, on its own card.
+ *
+ * Split out from StatusCard so each tier carries its own colour: a fresh
+ * 10-minute dump must never make a nightly tier that stopped days ago look fine.
+ */
+function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, newest, count, emptyText }) {
+  const palette = TIER_COLORS[up === true ? accent : up === false ? 'red' : 'gray'] || TIER_COLORS.gray;
+  return (
+    <div className={`rounded-xl border shadow-sm p-4 ${palette.border} ${palette.bg}`}>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+          <Icon className={`w-4 h-4 ${palette.icon}`} />
+          {title}
+        </div>
+        {up === true && <CheckCircle2 className="w-5 h-5 text-emerald-600" />}
+        {up === false && <XCircle className="w-5 h-5 text-red-600" />}
+        {up == null && <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${palette.chip}`}>N/A</span>}
+      </div>
+      <div className="mt-2 text-xs text-gray-600 space-y-0.5">
+        {emptyText ? (
+          <div>{emptyText}</div>
+        ) : (
+          <>
+            <div>
+              {newest
+                ? <>newest {timeAgo(newest.mtime, newest.ageHours != null ? Math.round(newest.ageHours * 3600) : null)} · {(newest.sizeBytes / 1024).toFixed(0)} KB</>
+                : 'none yet'}
+            </div>
+            <div>{count} file(s) kept{retention ? ` · ${retention}` : ''}</div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -150,14 +208,9 @@ export default function SystemHealth() {
     : server.memory.usedPct >= 90 ? 'red' : server.memory.usedPct >= 75 ? 'amber' : 'emerald';
   const tlsTone = !tls ? 'gray'
     : tls.daysLeft <= 1 ? 'red' : tls.daysLeft <= 2.5 ? 'amber' : 'emerald';
-  const backupTone = !backup || backup.ok == null ? 'gray' : backup.ok ? 'emerald' : 'red';
   const cpu = data?.cpu;
   const cpuTone = !cpu || cpu.usagePct == null ? 'gray'
     : cpu.usagePct >= 85 ? 'red' : cpu.usagePct >= 60 ? 'amber' : 'emerald';
-  const snapshots = data?.snapshots;
-  const snapTone = !snapshots ? 'gray'
-    : !snapshots.newest ? 'amber'
-      : snapshots.newest.ageHours > 2 ? 'amber' : 'emerald';
   const processes = data?.processes || null;
   const replicationReady = Boolean(replication?.configured) && !devMode;
 
@@ -278,7 +331,7 @@ export default function SystemHealth() {
           </div>
 
           {/* Instance cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             <StatusCard
               title={`Primary (${data.instances?.primary?.address?.port || 5432})`}
               icon={Server}
@@ -353,36 +406,9 @@ export default function SystemHealth() {
                 )
               }
             />
-            <StatusCard
-              title="Standby replica state"
-              icon={Clock}
-              up={devMode || !replication?.configured ? null
-                : replication.standbyInRecovery === true && !replicationPaused}
-              tone={devMode || !replication?.configured ? 'gray'
-                : replicationPaused || replication.standbyInRecovery === false ? 'amber' : undefined}
-              sub={
-                devMode || !replication?.configured ? (
-                  <div>Streaming standby runs on the production VPS</div>
-                ) : (
-                  <>
-                    <div>
-                      {replication.standbyInRecovery === true
-                        ? (replicationPaused ? 'read-only · replay PAUSED' : 'read-only · applying WAL')
-                        : 'promoted — accepts writes'}
-                    </div>
-                    {replication.senders > 0 && (
-                      <div>{replication.senders} WAL sender(s) connected</div>
-                    )}
-                    {replication.standbyReplayLsn && (
-                      <div className="font-mono truncate">{replication.standbyReplayLsn}</div>
-                    )}
-                  </>
-                )
-              }
-            />
           </div>
 
-          {/* Server resources + TLS + backup */}
+          {/* Server resources + TLS */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
             <MetricBar
               label="Disk usage"
@@ -412,37 +438,6 @@ export default function SystemHealth() {
                 : 'not available'}
             />
             <StatusCard
-              title={data.engine === 'postgres' ? 'Standby copy' : 'Hourly snapshots'}
-              icon={Camera}
-              up={data.engine === 'postgres'
-                ? (replication?.configured ? Boolean(replication.streaming) : null)
-                : (snapshots ? (snapshots.newest && snapshots.newest.ageHours <= 2) : null)}
-              tone={data.engine === 'postgres'
-                ? (replication?.configured ? replicationTone : 'gray')
-                : snapTone}
-              sub={data.engine === 'postgres' ? (
-                replication?.configured ? (
-                  <>
-                    <div>physical replica — the whole cluster is streamed, not copied</div>
-                    <div>no hourly dumps needed; nightly pg_dump covers restores</div>
-                  </>
-                ) : (
-                  <div>no standby configured on this server</div>
-                )
-              ) : snapshots ? (
-                <>
-                  <div>
-                    {snapshots.newest
-                      ? `newest: ${snapshots.newest.ageHours}h ago · ${(snapshots.newest.sizeBytes / 1024).toFixed(0)} KB`
-                      : 'none taken yet'}
-                  </div>
-                  <div>{snapshots.count} snapshot(s) kept (hourly, last 6)</div>
-                </>
-              ) : (
-                <div>Snapshot store lives on the production VPS</div>
-              )}
-            />
-            <StatusCard
               title="TLS certificate"
               icon={Lock}
               up={tls ? tls.daysLeft > 2.5 : null}
@@ -461,47 +456,47 @@ export default function SystemHealth() {
                 <div>certificate probe unavailable</div>
               )}
             />
-            <StatusCard
-              title={backup?.tiers ? `Backups (${Object.keys(backup.tiers).length} tiers)` : 'Nightly backup'}
-              icon={Archive}
-              up={devMode || !backup || backup.ok == null ? null : backup.ok}
-              tone={devMode ? 'gray' : backupTone}
-              sub={devMode ? (
-                <div>Tiered backups are stored on the production VPS (~/backups)</div>
-              ) : backup ? (
-                <>
-                  {backup.tiers ? (
-                    // Each tier is reported on its own so a healthy 10-minute
-                    // tier cannot make a stale nightly tier look fine.
-                    <div className="space-y-0.5">
-                      {[['tenMin', '10 min'], ['hourly', 'hourly'], ['nightly', 'nightly']].map(([key, label]) => {
-                        const tier = backup.tiers[key];
-                        if (!tier) return null;
-                        return (
-                          <div key={key} className="flex items-center justify-between gap-2">
-                            <span className="text-gray-500">{label}</span>
-                            <span className={tier.ok ? 'text-gray-700' : 'text-red-600 font-medium'}>
-                              {tier.newest ? timeAgo(tier.newest.mtime) : 'none'} · {tier.count} kept
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div>
-                      {backup.newest
-                        ? `newest: ${backup.newest.ageHours}h ago · ${(backup.newest.sizeBytes / 1024).toFixed(0)} KB`
-                        : 'none found'}
-                    </div>
-                  )}
-                  <div>{backup.backupCount} backup file(s) kept in ~/backups</div>
-                  {backup.problem && <div className="text-red-600 font-medium">{backup.problem}</div>}
-                </>
-              ) : (
-                <div>backup folder not readable</div>
-              )}
-            />
           </div>
+
+          {/* Backup tiers — one card per cadence, each with its own colour so a
+              stale tier is visible without reading the numbers. */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+            {backup?.tiers ? (
+              BACKUP_TIER_CARDS.map(({ key, title, icon, accent, retention }) => (
+                <BackupTierCard
+                  key={key}
+                  title={title}
+                  icon={icon}
+                  accent={accent}
+                  up={devMode ? null : (backup.tiers[key]?.ok ?? null)}
+                  retention={retention}
+                  newest={backup.tiers[key]?.newest || null}
+                  count={backup.tiers[key]?.count ?? 0}
+                />
+              ))
+            ) : (
+              // No tier breakdown: either this machine has no backup folder at
+              // all (dev) or the retained MySQL dumps are still the only ones.
+              <BackupTierCard
+                title="Backups"
+                icon={Archive}
+                accent="nightly"
+                up={devMode || !backup || backup.ok == null ? null : backup.ok}
+                newest={backup?.newest || null}
+                count={backup?.backupCount ?? 0}
+                emptyText={devMode
+                  ? 'Tiered backups are stored on the production VPS (~/backups)'
+                  : !backup ? 'backup folder not readable' : null}
+              />
+            )}
+          </div>
+
+          {backup?.backupCount != null && (
+            <div className="flex flex-wrap items-center gap-x-2 text-xs text-gray-500">
+              <span>{backup.backupCount} backup file(s) kept in ~/backups</span>
+              {backup.problem && <span className="text-red-600 font-medium">· {backup.problem}</span>}
+            </div>
+          )}
 
           {/* Sync controller + pm2 services */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
