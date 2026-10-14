@@ -31,6 +31,10 @@ const HOME = os.homedir();
 const STATUS_FILE = process.env.DB_SYNC_STATUS_FILE
   || path.join(HOME, 'mysql-standby', 'status.json');
 const BACKUPS_DIR = process.env.BACKUPS_DIR || path.join(HOME, 'backups');
+// Operator-editable standby copy cadence. The db-sync daemon re-reads this file
+// every minute, so a save here takes effect without a daemon restart.
+const SYNC_CONFIG_FILE = process.env.DB_SYNC_CONFIG_FILE
+  || path.join(path.dirname(STATUS_FILE), 'sync-config.json');
 
 function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
@@ -329,6 +333,44 @@ function mergeTimelines(daemonEvents, dbEvents) {
   return merged;
 }
 
+// ----------------------------------------------------------- copy cadence --
+// How often the retained MySQL standby is refreshed. Bounds match the daemon's
+// (scripts/db/standby/sync-standby.js) so the page can never save a value the
+// daemon would reject.
+const SYNC_INTERVAL_LIMITS = { minMinutes: 1, maxMinutes: 1440, defaultMinutes: 10 };
+const SYNC_INTERVAL_PICKUP_SECONDS = 60;
+
+/**
+ * The saved cadence plus where it came from.
+ *
+ * `source` matters: 'default' means nobody has ever chosen a value, so the page
+ * shows the fallback without pretending it was configured.
+ */
+function syncIntervalConfig() {
+  const cfg = readJsonSafe(SYNC_CONFIG_FILE);
+  const minutes = Number(cfg && cfg.intervalMinutes);
+  if (Number.isFinite(minutes)
+    && minutes >= SYNC_INTERVAL_LIMITS.minMinutes
+    && minutes <= SYNC_INTERVAL_LIMITS.maxMinutes) {
+    return {
+      minutes,
+      source: 'config',
+      updatedAt: cfg.updatedAt || null,
+      updatedBy: cfg.updatedBy || null,
+    };
+  }
+  const envMs = Number(process.env.DB_SYNC_INTERVAL_MS);
+  if (Number.isFinite(envMs) && envMs > 0) {
+    return { minutes: Math.round(envMs / 60000), source: 'env', updatedAt: null, updatedBy: null };
+  }
+  return {
+    minutes: SYNC_INTERVAL_LIMITS.defaultMinutes,
+    source: 'default',
+    updatedAt: null,
+    updatedBy: null,
+  };
+}
+
 // ------------------------------------------------------------ cpu probe ---
 // Instantaneous CPU snapshot: sample per-core times twice, 300ms apart.
 async function cpuUsage() {
@@ -440,6 +482,7 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
     ]);
 
     const backup = backupCheck();
+    const standbySync = syncIntervalConfig();
 
     res.json({
       timestamp: new Date().toISOString(),
@@ -484,6 +527,24 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
         lastFailback: sync.lastFailback || null,
         daemonUpdatedAt: sync.updatedAt || null,
         daemonSecondsAgo: fileAgeSeconds(sync.updatedAt),
+      },
+      // The retained MySQL standby's copy cadence. The PostgreSQL standby the app
+      // actually runs on streams instead and has no interval, so this is
+      // reported separately rather than mixed into `replication`.
+      standbySync: {
+        ...standbySync,
+        // What the daemon last reported running, and where it says that came
+        // from. It can lag a fresh save until the next config poll, which is what
+        // the page tells the operator. The daemon's own report wins over this
+        // endpoint's inference: DB_SYNC_INTERVAL_MS lives in the daemon's env
+        // file, which the app cannot see.
+        source: (sync && sync.intervalSource) || standbySync.source,
+        effectiveMinutes: sync && Number.isFinite(Number(sync.intervalMinutes))
+          ? Number(sync.intervalMinutes)
+          : standbySync.minutes,
+        minMinutes: SYNC_INTERVAL_LIMITS.minMinutes,
+        maxMinutes: SYNC_INTERVAL_LIMITS.maxMinutes,
+        pickupSeconds: SYNC_INTERVAL_PICKUP_SECONDS,
       },
       server: stats,
       cpu,
@@ -549,6 +610,54 @@ router.post('/sync/:action', requireMasterAdmin, async (req, res) => {
     warning: action === 'pause'
       ? 'Replay paused — the standby stops applying WAL until you resume, so a promotion right now would lose everything written since the pause.'
       : null,
+  });
+});
+
+// Standby copy cadence — how often the retained MySQL standby is refreshed.
+//
+// Saved to a small JSON file that the db-sync daemon re-reads every minute, so a
+// change lands without restarting the daemon and without shell access on the
+// VPS. This is NOT the PostgreSQL path: the standby the app serves from streams
+// continuously and has no interval to tune.
+router.put('/standby-interval', requireMasterAdmin, async (req, res) => {
+  const { minMinutes, maxMinutes } = SYNC_INTERVAL_LIMITS;
+  const minutes = Number(req.body ? req.body.minutes : undefined);
+  if (!Number.isInteger(minutes) || minutes < minMinutes || minutes > maxMinutes) {
+    return res.status(400).json({
+      error: `minutes must be a whole number between ${minMinutes} and ${maxMinutes}`,
+    });
+  }
+
+  const previous = syncIntervalConfig();
+  const updatedBy = (req.user && (req.user.email || req.user.username)) || 'master admin';
+  const payload = { intervalMinutes: minutes, updatedAt: new Date().toISOString(), updatedBy };
+
+  // Write-then-rename: the daemon reads this file every minute and must never
+  // catch it half-written, which would look to it like "no config at all".
+  const tmp = SYNC_CONFIG_FILE + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(SYNC_CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, SYNC_CONFIG_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* nothing to clean up */ }
+    console.error('[system-standby-interval]', e);
+    return res.status(500).json({ error: 'could not save ' + SYNC_CONFIG_FILE + ': ' + e.message });
+  }
+
+  try {
+    await recordFailoverEvent(
+      'INFO',
+      `Standby copy interval changed ${previous.minutes} min → ${minutes} min by ${updatedBy}`,
+      { configFile: SYNC_CONFIG_FILE, source: previous.source }
+    );
+  } catch (e) { /* best-effort audit trail */ }
+
+  res.json({
+    ok: true,
+    ...syncIntervalConfig(),
+    previousMinutes: previous.minutes,
+    pickupSeconds: SYNC_INTERVAL_PICKUP_SECONDS,
   });
 });
 

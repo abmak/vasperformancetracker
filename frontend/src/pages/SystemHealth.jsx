@@ -144,6 +144,10 @@ export default function SystemHealth() {
   const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [syncBusy, setSyncBusy] = useState(false);
+  const [intervalDraft, setIntervalDraft] = useState('');
+  // The 15-second auto-refresh must not type over the operator's edit.
+  const [intervalDirty, setIntervalDirty] = useState(false);
+  const [intervalBusy, setIntervalBusy] = useState(false);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -174,6 +178,25 @@ export default function SystemHealth() {
       setSyncBusy(false);
     }
   }, [load]);
+
+  const saveInterval = useCallback(async () => {
+    const minutes = Number(intervalDraft);
+    if (!Number.isInteger(minutes)) {
+      toast.error('Enter a whole number of minutes');
+      return;
+    }
+    setIntervalBusy(true);
+    try {
+      const r = await systemAPI.setStandbyInterval(minutes);
+      toast.success(`Standby copy cadence saved: every ${r.minutes} min — the daemon picks it up within ${r.pickupSeconds}s`);
+      setIntervalDirty(false);
+      await load();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setIntervalBusy(false);
+    }
+  }, [intervalDraft, load]);
 
   useEffect(() => {
     load();
@@ -213,6 +236,20 @@ export default function SystemHealth() {
     : cpu.usagePct >= 85 ? 'red' : cpu.usagePct >= 60 ? 'amber' : 'emerald';
   const processes = data?.processes || null;
   const replicationReady = Boolean(replication?.configured) && !devMode;
+  // The retained MySQL standby's whole-database copy cadence (configurable), as
+  // opposed to the PostgreSQL standby, which streams and has no interval.
+  const standbySync = data?.standbySync;
+  const copyMinutes = standbySync?.effectiveMinutes ?? standbySync?.minutes ?? 10;
+  const copySource = standbySync?.source === 'config'
+    ? `saved by ${standbySync.updatedBy || 'a master admin'}${standbySync.updatedAt ? ' · ' + new Date(standbySync.updatedAt).toLocaleString() : ''}`
+    : standbySync?.source === 'env'
+      ? 'from DB_SYNC_INTERVAL_MS on the server'
+      : 'built-in default — nobody has set one yet';
+
+  useEffect(() => {
+    if (!standbySync || intervalDirty) return;
+    setIntervalDraft(String(standbySync.minutes));
+  }, [standbySync, intervalDirty]);
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -498,8 +535,8 @@ export default function SystemHealth() {
             </div>
           )}
 
-          {/* Sync controller + pm2 services */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          {/* Sync controller + copy cadence + pm2 services */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             <div className="rounded-xl border border-gray-200 bg-white p-4">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
@@ -536,6 +573,52 @@ export default function SystemHealth() {
               {!replicationReady && (
                 <div className="mt-2 text-xs text-blue-700">Streaming replication runs on the production VPS only.</div>
               )}
+            </div>
+
+            <div className="rounded-xl border border-gray-200 bg-white p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                  <Timer className="w-4 h-4 text-gray-500" />
+                  Standby copy cadence
+                </div>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
+                  every {copyMinutes} min
+                </span>
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                How often the retained MySQL standby is re-copied wholesale as the rollback path. The
+                PostgreSQL standby the app serves from streams WAL continuously and has no interval — this
+                setting does not slow that down. A new value is picked up within about a minute, with no
+                daemon restart.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input
+                  type="number"
+                  min={standbySync?.minMinutes ?? 1}
+                  max={standbySync?.maxMinutes ?? 1440}
+                  value={intervalDraft}
+                  onChange={(e) => { setIntervalDraft(e.target.value); setIntervalDirty(true); }}
+                  className="w-24 px-2.5 py-1.5 text-sm rounded-lg border border-gray-200 focus:border-emerald-500 focus:outline-none"
+                />
+                <span className="text-xs text-gray-500">
+                  minutes ({standbySync?.minMinutes ?? 1}–{standbySync?.maxMinutes ?? 1440})
+                </span>
+                <button
+                  onClick={saveInterval}
+                  disabled={intervalBusy || !intervalDirty}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {intervalBusy && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  Save
+                </button>
+                {intervalDirty && <span className="text-xs text-amber-700">unsaved</span>}
+              </div>
+              <div className="mt-2 text-xs text-gray-400">
+                currently: {copyMinutes} min · {copySource}
+                {standbySync && standbySync.effectiveMinutes !== standbySync.minutes && !intervalDirty && (
+                  <span className="text-amber-700"> · daemon still on {standbySync.effectiveMinutes} min until its next poll</span>
+                )}
+              </div>
             </div>
 
             <div className="rounded-xl border border-gray-200 bg-white p-4">
@@ -603,12 +686,18 @@ export default function SystemHealth() {
           {/* What this means */}
           <div className="rounded-xl border border-gray-200 bg-white p-4 text-xs text-gray-600 leading-relaxed">
             <span className="font-semibold text-gray-800">How failover works here: </span>
-            every 2 minutes the whole database is copied primary → standby (a full ~3 MB copy, self-healing).
-            If the primary crashes, the next API request switches to the standby instantly — users notice nothing
-            after that one request. When the primary is healthy again (2 probes), it is restored <em>from</em> the
-            standby so no data written during the outage is lost, and the app switches back automatically.
+            the standby streams the primary's write-ahead log continuously, so it is only ever a moment
+            behind — there is no copy interval to wait out. If the primary becomes unreachable, the next API
+            request moves to the standby: the replica is promoted first (a read-only replica rejects writes),
+            then serves, so a user loses at most that one request. Once the primary is healthy again it is
+            restored <em>from</em> the standby, so nothing written during the outage is lost, and the app
+            switches back automatically. If the standby had to be promoted, it owns data the old primary never
+            saw — failback then stays blocked until the primary is rebuilt (see the database runbook).
             Failover/failback events notify master admins automatically and appear in the timeline above.
-            Status refreshes every 15 seconds while this page is open.
+            {' '}Separately, the retained MySQL standby is still copied whole every{' '}
+            <span className="font-semibold text-gray-700">{copyMinutes} minutes</span>
+            {' '}({standbySync?.source === 'config' ? 'your saved cadence' : 'the built-in default'}) as the
+            rollback path. Status refreshes every 15 seconds while this page is open.
           </div>
         </>
       )}

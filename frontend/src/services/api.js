@@ -28,6 +28,9 @@ export async function request(endpoint, options = {}) {
 export const systemAPI = {
   getHealth: () => request('/system/health'),
   controlSync: (action) => request(`/system/sync/${action}`, { method: 'POST' }),
+  // Standby copy cadence, in minutes (1–1440). Applies without a daemon restart.
+  setStandbyInterval: (minutes) =>
+    request('/system/standby-interval', { method: 'PUT', body: { minutes } }),
 };
 
 // User Guide content (editable by the super admin)

@@ -3,7 +3,7 @@
  * Standby database sync daemon — installed on the VPS at
  * ~/mysql-standby/sync-standby.js and run under pm2 as "db-sync".
  *
- * Every DB_SYNC_INTERVAL_MS (default 2 min), when the app is running on the
+ * Every DB_SYNC_INTERVAL_MS (default 10 min), when the app is running on the
  * PRIMARY (no failover marker):
  *   - dumps the primary with mysqldump --single-transaction
  *   - restores that dump into the standby instance (port DB_STANDBY_PORT)
@@ -65,7 +65,16 @@ const LOG_DIR = path.join(HOME, 'mysql-standby', 'log');
 const LOG_FILE = path.join(LOG_DIR, 'sync.log');
 const STATUS_FILE = process.env.DB_SYNC_STATUS_FILE || path.join(HOME, 'mysql-standby', 'status.json');
 const SNAP_DIR = path.join(HOME, 'backups', 'standby-snapshots');
-const INTERVAL_MS = Number(env.DB_SYNC_INTERVAL_MS || 600000);
+// Operator-editable cadence, written by the app (System Health → "Standby copy
+// cadence") and re-read every minute, so changing it from the page takes effect
+// without restarting this daemon. DB_SYNC_INTERVAL_MS stays the fallback for a
+// host with no config file.
+const CONFIG_FILE = process.env.DB_SYNC_CONFIG_FILE
+  || path.join(path.dirname(STATUS_FILE), 'sync-config.json');
+const DEFAULT_INTERVAL_MS = Number(env.DB_SYNC_INTERVAL_MS || 600000);
+const MIN_INTERVAL_MINUTES = 1;
+const MAX_INTERVAL_MINUTES = 1440;
+const CONFIG_POLL_MS = 60 * 1000;
 const TIMEOUT_MS = Number(env.DB_SYNC_TIMEOUT_MS || 180000);
 const FAILBACK_AFTER_HEALTHY = 2; // consecutive healthy primary probes before failback
 const SNAP_INTERVAL_MS = 60 * 60 * 1000;
@@ -76,6 +85,42 @@ const STATUS = process.argv.includes('--status');
 if (!DB_PASSWORD) {
   console.error('[fatal] could not read DB_PASSWORD from ' + ENV_FILE);
   process.exit(1);
+}
+
+// ------------------------------------------------------------ copy cadence --
+/**
+ * intervalMinutes from sync-config.json, or null when the file is missing or
+ * the value is unusable. A malformed file is reported rather than silently
+ * replaced, so an operator never believes a saved cadence is in force when it
+ * is not (the daemon keeps running on the previous value).
+ */
+function configuredIntervalMs() {
+  let cfg = null;
+  try {
+    cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') logOnce('cfg-read', 'could not read ' + CONFIG_FILE + ': ' + e.message);
+    return null;
+  }
+  const minutes = Number(cfg && cfg.intervalMinutes);
+  if (Number.isFinite(minutes) && minutes >= MIN_INTERVAL_MINUTES && minutes <= MAX_INTERVAL_MINUTES) {
+    return Math.round(minutes * 60000);
+  }
+  logOnce('cfg-bad', 'sync-config.json intervalMinutes is not usable (' + (cfg && cfg.intervalMinutes)
+    + ') — keeping ' + (DEFAULT_INTERVAL_MS / 60000) + ' min');
+  return null;
+}
+
+function effectiveIntervalMs() {
+  return configuredIntervalMs() || DEFAULT_INTERVAL_MS;
+}
+
+// Reported in status.json so the admin page shows where the running cadence
+// actually came from — the app cannot infer this, because the value can come
+// from this file's env (DB_SYNC_INTERVAL_MS) and not from the app's own env.
+function intervalSourceLabel() {
+  if (configuredIntervalMs()) return 'config';
+  return env.DB_SYNC_INTERVAL_MS ? 'env' : 'default';
 }
 
 // ---------------------------------------------------------------- logging --
@@ -390,9 +435,27 @@ else if (ONCE) {
   runCycle().then(() => process.exit(0)).catch((e) => { log('once-mode error: ' + e.message); process.exit(1); });
 }
 else {
-  log('db-sync daemon starting (interval ' + (INTERVAL_MS / 1000) + 's, primary ' +
+  let intervalMs = effectiveIntervalMs();
+  log('db-sync daemon starting (interval ' + (intervalMs / 1000) + 's, primary ' +
     PRIMARY.host + ':' + PRIMARY.port + ' → standby ' + STANDBY.host + ':' + STANDBY.port + ')');
-  writeStatusFile({ daemonStartedAt: new Date().toISOString() });
+  log('copy cadence source: ' + (configuredIntervalMs() ? CONFIG_FILE : 'DB_SYNC_INTERVAL_MS / default'));
+  writeStatusFile({
+    daemonStartedAt: new Date().toISOString(),
+    intervalMinutes: intervalMs / 60000,
+    intervalSource: intervalSourceLabel(),
+  });
   runCycle().catch(() => { });
-  setInterval(() => runCycle().catch(() => { }), INTERVAL_MS);
+  let timer = setInterval(() => runCycle().catch(() => { }), intervalMs);
+
+  // Watch the config file so an operator's change applies from the next cycle.
+  setInterval(() => {
+    const next = effectiveIntervalMs();
+    if (next === intervalMs) return;
+    log('copy interval changed ' + (intervalMs / 60000) + ' min → ' + (next / 60000) + ' min (from ' + CONFIG_FILE + ')');
+    pushEvent('SYNC_INTERVAL', 'standby copy interval changed to ' + (next / 60000) + ' min');
+    clearInterval(timer);
+    intervalMs = next;
+    writeStatusFile({ intervalMinutes: intervalMs / 60000, intervalSource: intervalSourceLabel() });
+    timer = setInterval(() => runCycle().catch(() => { }), intervalMs);
+  }, CONFIG_POLL_MS);
 }
