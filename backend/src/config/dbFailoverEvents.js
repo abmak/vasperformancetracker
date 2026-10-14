@@ -18,6 +18,10 @@ let ensured = false;
 
 async function ensureTable() {
   if (ensured) return;
+  // Required lazily for the same circular-dependency reason as everywhere else
+  // in this module: `db` used to be referenced without ever being required, so
+  // every failover event was silently lost to a ReferenceError.
+  const db = require('./database');
   await db.query(`
     CREATE TABLE IF NOT EXISTS system_events (
       id INT AUTO_INCREMENT PRIMARY KEY,

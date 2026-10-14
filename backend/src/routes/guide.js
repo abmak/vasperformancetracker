@@ -58,17 +58,17 @@ function ensureGuideTable() {
       await db.query(`
         CREATE TABLE IF NOT EXISTS guide_content (
           section VARCHAR(30) PRIMARY KEY,
-          content LONGTEXT NOT NULL,
+          content TEXT NOT NULL,
           updated_by VARCHAR(100) NULL,
-          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
       `);
       const [rows] = await db.query('SELECT section FROM guide_content');
       const have = new Set(rows.map((r) => r.section));
       for (const section of GUIDE_SECTIONS) {
         if (!have.has(section)) {
           await db.query(
-            'INSERT INTO guide_content (section, content, updated_by) VALUES (?, ?, ?)',
+            'INSERT INTO guide_content (section, content, updated_by) VALUES (?, ?, ?) ON CONFLICT (section) DO NOTHING',
             [section, defaultGuide(section), 'system default']
           );
         }
@@ -127,7 +127,7 @@ router.put('/:section', async (req, res) => {
     const updatedBy = req.user?.username || req.user?.email || 'super admin';
     await db.query(
       `INSERT INTO guide_content (section, content, updated_by) VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE content = VALUES(content), updated_by = VALUES(updated_by)`,
+       ON CONFLICT (section) DO UPDATE SET content = EXCLUDED.content, updated_by = EXCLUDED.updated_by, updated_at = CURRENT_TIMESTAMP`,
       [section, content, updatedBy]
     );
     const [rows] = await db.query('SELECT section, content, updated_by, updated_at FROM guide_content WHERE section = ?', [section]);

@@ -175,6 +175,9 @@ function splitTopics(md) {
       current.lines.push(line);
     }
   }
+  if (topics.length === 0 && (md || '').trim()) {
+    topics.push({ title: 'Overview', slug: 'overview', lines });
+  }
   return topics.map((t) => ({ title: t.title, slug: t.slug, body: t.lines.join('\n').trim() }));
 }
 

@@ -32,8 +32,7 @@ function buildTargetFilter(start_date, end_date, period_value, period_type) {
   let filter = '';
   const params = [];
   if (start_date && end_date) {
-    // Use DATE() to strip timezone offsets from datetime columns
-    filter = 'WHERE (DATE_FORMAT(target_end_date, "%Y-%m-%d") >= ? OR target_end_date IS NULL) AND (DATE_FORMAT(target_start_date, "%Y-%m-%d") <= ? OR target_start_date IS NULL)';
+    filter = 'WHERE (DATE_FORMAT(target_end_date, \'%Y-%m-%d\') >= ? OR target_end_date IS NULL) AND (DATE_FORMAT(target_start_date, \'%Y-%m-%d\') <= ? OR target_start_date IS NULL)';
     params.push(start_date.substring(0, 10), end_date.substring(0, 10));
   } else if (period_value) {
     filter = 'WHERE period_value = ?';
@@ -86,7 +85,7 @@ router.get('/performance', async (req, res) => {
         `SELECT rt.*, COALESCE(vs.name, rt.service_name) as service_name
          FROM revenue_targets rt
          LEFT JOIN vas_services vs ON rt.service_id = vs.id
-         ${targetFilter ? targetFilter + ' AND (rt.service_id IS NULL OR vs.status = \'active\')' : 'WHERE rt.service_id IS NULL OR vs.status = \'active\''} GROUP BY rt.id`,
+         ${targetFilter ? targetFilter + ' AND (rt.service_id IS NULL OR vs.status = \'active\')' : 'WHERE rt.service_id IS NULL OR vs.status = \'active\''} GROUP BY rt.id, vs.name`,
         targetParams
       ),
       pool.execute(

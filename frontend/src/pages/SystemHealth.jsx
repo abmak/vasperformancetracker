@@ -12,8 +12,9 @@ import { systemAPI } from '../services/api';
  * System Health — Administration module for the master admin.
  *
  * Shows which database the app is currently serving from (primary/standby),
- * liveness of both MySQL instances, the failover marker state and the sync
- * daemon's last successful sync. Data from GET /api/system/health.
+ * liveness of both PostgreSQL instances, streaming replication state (a standby
+ * is read-only until it is promoted) and the nightly pg_dump backup.
+ * Data from GET /api/system/health.
  */
 
 function timeAgo(iso, secondsAgo) {
@@ -101,13 +102,13 @@ export default function SystemHealth() {
 
   const controlSync = useCallback(async (action) => {
     if (action === 'pause' && !window.confirm(
-      'Pause the primary→standby sync?\n\n- The standby keeps its last copied data\n- Automatic failback is disabled while paused\n- Failover itself still works (the app handles it)\n\nResume anytime from this page.'
+      'Pause replication to the standby?\n\n- The standby keeps receiving WAL but stops applying it\n- It falls further behind while paused\n- If the primary fails while paused, a promotion loses everything written since\n\nResume anytime from this page.'
     )) return;
     setSyncBusy(true);
     try {
       const r = await systemAPI.controlSync(action);
       if (r.warning) toast(r.warning, { icon: '⏸️', duration: 6000 });
-      else toast.success('Sync daemon ' + (action === 'pause' ? 'paused' : 'resumed'));
+      else toast.success('Standby replication ' + (action === 'pause' ? 'paused' : 'resumed'));
       await load();
     } catch (e) {
       toast.error(e.message);
@@ -128,13 +129,18 @@ export default function SystemHealth() {
 
   const target = data?.dbTarget;
   const failoverActive = data?.failover?.active;
-  const sync = data?.sync;
+  // PostgreSQL replaced the MySQL db-sync daemon: replication state now arrives
+  // in `data.replication` (the legacy `data.sync` block is no longer shown).
+  const replication = data?.replication;
+  const replicationPaused = replication?.replayPaused === true;
+  const replicationTone = !replication?.configured ? 'gray'
+    : replication.error ? 'red'
+      : replication.streaming && !replicationPaused ? 'emerald' : 'amber';
   const server = data?.server;
   const tls = data?.tls;
   const backup = data?.backup;
   const timeline = data?.timeline || [];
-  const staleSync = sync?.lastSyncSecondsAgo != null && sync.lastSyncSecondsAgo > 360;
-  // Dev machine: no standby configured → sync/daemon/backup cards are
+  // Dev machine: no standby configured → replication/backup cards are
   // production-only and must show neutral, not alarming, states.
   const devMode = Boolean(data && !data.failover?.standbyConfigured);
 
@@ -153,8 +159,7 @@ export default function SystemHealth() {
     : !snapshots.newest ? 'amber'
       : snapshots.newest.ageHours > 2 ? 'amber' : 'emerald';
   const processes = data?.processes || null;
-  const daemonProc = processes && processes.find((p) => p.name === 'db-sync');
-  const daemonPaused = daemonProc ? daemonProc.status !== 'online' : null;
+  const replicationReady = Boolean(replication?.configured) && !devMode;
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -205,8 +210,8 @@ export default function SystemHealth() {
         <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 flex items-start gap-2">
           <Info className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
           <div className="text-xs text-blue-800">
-            <span className="font-semibold">Development environment.</span> The standby database, 2-minute sync,
-            sync daemon, TLS certificate and nightly backups live on the production VPS — the cards below reflect
+            <span className="font-semibold">Development environment.</span> The standby database, streaming
+            replication, TLS certificate and nightly backups live on the production VPS — the cards below reflect
             this machine only. Open the production app (https://196.189.155.179:5000) for the full picture.
           </div>
         </div>
@@ -218,8 +223,23 @@ export default function SystemHealth() {
           <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5" />
           <div className="text-sm text-amber-800">
             <span className="font-bold">Failover active — the app is running on the STANDBY database.</span>{' '}
-            The primary is unreachable; once it is healthy again the system restores and switches back automatically.
-            Writes are safe and are synced back during failback.
+            {data.failover?.standbyPromoted ? (
+              <>
+                The standby was <span className="font-semibold">promoted</span> and now accepts writes, so it owns
+                data the old primary never saw. Failback stays blocked until the primary is rebuilt as a fresh
+                replica of it (see the database runbook) — that is why the switch back is not automatic here.
+              </>
+            ) : (
+              <>
+                The primary is unreachable. Writes go to the failover target, and the primary has to be rebuilt
+                from it before traffic can move back.
+              </>
+            )}
+            {data.failover?.failbackAllowed === false && (
+              <div className="mt-1 font-semibold text-amber-900">
+                Failback blocked: the promoted standby holds newer data than the old primary.
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -260,7 +280,7 @@ export default function SystemHealth() {
           {/* Instance cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
             <StatusCard
-              title="Primary (3306)"
+              title={`Primary (${data.instances?.primary?.address?.port || 5432})`}
               icon={Server}
               up={data.instances?.primary?.up}
               sub={
@@ -269,12 +289,15 @@ export default function SystemHealth() {
                     && <div className="font-mono">{data.instances.primary.address.host}:{data.instances.primary.address.port}</div>}
                   {data.instances?.primary?.up === false && data.instances?.primary?.error
                     && <div className="text-red-600">{data.instances.primary.error}</div>}
+                  {data.instances?.primary?.inRecovery === true && (
+                    <div className="text-amber-700 font-medium">running as a read-only replica</div>
+                  )}
                   {target === 'primary' && <div className="text-emerald-700 font-medium">serving the app now</div>}
                 </>
               }
             />
             <StatusCard
-              title="Standby (3307)"
+              title={`Standby (${data.instances?.standby?.address?.port || 5433})`}
               icon={HardDrive}
               up={data.failover?.standbyConfigured ? data.instances?.standby?.up : null}
               sub={
@@ -285,6 +308,12 @@ export default function SystemHealth() {
                         && <div className="font-mono">{data.instances.standby.address.host}:{data.instances.standby.address.port}</div>}
                       {data.instances?.standby?.up === false && data.instances?.standby?.error
                         && <div className="text-red-600">{data.instances.standby.error}</div>}
+                      {data.instances?.standby?.inRecovery === true && (
+                        <div>read-only replica — promotion makes it writable</div>
+                      )}
+                      {data.instances?.standby?.inRecovery === false && (
+                        <div className="text-amber-700 font-medium">promoted — accepts writes</div>
+                      )}
                       {target === 'standby' && <div className="text-emerald-700 font-medium">serving the app now</div>}
                     </>
                   ) : (
@@ -294,49 +323,58 @@ export default function SystemHealth() {
               }
             />
             <StatusCard
-              title="Last sync (primary → standby)"
+              title="Replication (primary → standby)"
               icon={ArrowRightLeft}
-              up={devMode ? null : staleSync ? false : Boolean(sync?.lastSyncOk)}
-              tone={devMode ? 'gray' : staleSync ? 'amber' : undefined}
+              up={devMode || !replication?.configured ? null
+                : replication.streaming && !replicationPaused}
+              tone={devMode ? 'gray' : replicationTone}
               sub={
-                devMode ? (
-                  <div>Sync runs on the production VPS every 2 minutes</div>
-                ) : sync?.lastSyncOk ? (
-                  <>
-                    <div>{timeAgo(sync.lastSyncOk, sync.lastSyncSecondsAgo)}</div>
-                    <div>
-                      {sync.lastSyncDurationSeconds
-                        && <>took {sync.lastSyncDurationSeconds}s · {(sync.lastSyncBytes / 1024).toFixed(0)} KB</>}
-                    </div>
-                    {sync.lastSyncError && <div className="text-red-600">{sync.lastSyncError}</div>}
-                  </>
+                devMode || !replication?.configured ? (
+                  <div>Streaming replication runs on the production VPS</div>
+                ) : replication.error ? (
+                  <div className="text-red-600">{replication.error}</div>
                 ) : (
-                  <div>No successful sync recorded yet</div>
+                  <>
+                    <div>
+                      {replication.state
+                        ? `${replication.state}${replication.syncState ? ' · ' + replication.syncState : ''}`
+                        : 'no replica connected'}
+                    </div>
+                    <div>
+                      lag {replication.lagBytes == null
+                        ? '—'
+                        : `${(replication.lagBytes / 1024).toFixed(0)} KB`}
+                      {replication.lagSeconds != null && <> · {replication.lagSeconds}s behind</>}
+                    </div>
+                    {replication.lastReplayAt && (
+                      <div>last replayed {timeAgo(replication.lastReplayAt, null)}</div>
+                    )}
+                  </>
                 )
               }
             />
             <StatusCard
-              title="Sync daemon"
+              title="Standby replica state"
               icon={Clock}
-              up={devMode ? null : sync?.daemonSecondsAgo != null && sync.daemonSecondsAgo < 600}
-              tone={devMode ? 'gray' : undefined}
+              up={devMode || !replication?.configured ? null
+                : replication.standbyInRecovery === true && !replicationPaused}
+              tone={devMode || !replication?.configured ? 'gray'
+                : replicationPaused || replication.standbyInRecovery === false ? 'amber' : undefined}
               sub={
-                devMode ? (
-                  <div>Daemon (pm2: db-sync) runs on the production VPS</div>
+                devMode || !replication?.configured ? (
+                  <div>Streaming standby runs on the production VPS</div>
                 ) : (
                   <>
                     <div>
-                      {sync?.daemonUpdatedAt
-                        ? `reporting (${timeAgo(sync.daemonUpdatedAt, sync.daemonSecondsAgo)})`
-                        : 'no status file — check pm2'}
+                      {replication.standbyInRecovery === true
+                        ? (replicationPaused ? 'read-only · replay PAUSED' : 'read-only · applying WAL')
+                        : 'promoted — accepts writes'}
                     </div>
-                    {sync?.failbackProbeCount > 0 && (
-                      <div>
-                        failback probe {sync.failbackProbeCount}/{sync.failbackProbeRequired}
-                      </div>
+                    {replication.senders > 0 && (
+                      <div>{replication.senders} WAL sender(s) connected</div>
                     )}
-                    {sync?.lastFailback && (
-                      <div>last failback {timeAgo(sync.lastFailback, null)}</div>
+                    {replication.standbyReplayLsn && (
+                      <div className="font-mono truncate">{replication.standbyReplayLsn}</div>
                     )}
                   </>
                 )
@@ -374,11 +412,24 @@ export default function SystemHealth() {
                 : 'not available'}
             />
             <StatusCard
-              title="Hourly snapshots"
+              title={data.engine === 'postgres' ? 'Standby copy' : 'Hourly snapshots'}
               icon={Camera}
-              up={snapshots ? (snapshots.newest && snapshots.newest.ageHours <= 2) : null}
-              tone={snapTone}
-              sub={snapshots ? (
+              up={data.engine === 'postgres'
+                ? (replication?.configured ? Boolean(replication.streaming) : null)
+                : (snapshots ? (snapshots.newest && snapshots.newest.ageHours <= 2) : null)}
+              tone={data.engine === 'postgres'
+                ? (replication?.configured ? replicationTone : 'gray')
+                : snapTone}
+              sub={data.engine === 'postgres' ? (
+                replication?.configured ? (
+                  <>
+                    <div>physical replica — the whole cluster is streamed, not copied</div>
+                    <div>no hourly dumps needed; nightly pg_dump covers restores</div>
+                  </>
+                ) : (
+                  <div>no standby configured on this server</div>
+                )
+              ) : snapshots ? (
                 <>
                   <div>
                     {snapshots.newest
@@ -441,36 +492,37 @@ export default function SystemHealth() {
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
                   <ArrowRightLeft className="w-4 h-4 text-gray-500" />
-                  Primary → standby sync controller
+                  Streaming replication controller
                 </div>
-                {daemonProc ? (
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${daemonPaused ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                    {daemonPaused ? 'PAUSED' : 'RUNNING'}
+                {replicationReady ? (
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${replicationPaused ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                    {replicationPaused ? 'REPLAY PAUSED' : 'STREAMING'}
                   </span>
                 ) : (
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">N/A</span>
                 )}
               </div>
               <p className="mt-2 text-xs text-gray-500">
-                Every 2 minutes the whole database is copied primary → standby. Pausing stops new copies and
-                disables automatic failback; failover itself is handled by the app and keeps working.
+                The standby streams the primary's write-ahead log continuously. Pausing replay keeps receiving WAL
+                but stops applying it, so the standby falls behind — and a promotion taken while paused would lose
+                everything written since.
               </p>
-              {daemonPaused != null && !devMode && (
+              {replicationReady && (
                 <button
-                  onClick={() => controlSync(daemonPaused ? 'resume' : 'pause')}
+                  onClick={() => controlSync(replicationPaused ? 'resume' : 'pause')}
                   disabled={syncBusy}
                   className={`mt-3 inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold rounded-lg text-white disabled:opacity-50 ${
-                    daemonPaused
+                    replicationPaused
                       ? 'bg-emerald-600 hover:bg-emerald-700'
                       : 'bg-red-600 hover:bg-red-700'
                   }`}
                 >
-                  {daemonPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
-                  {daemonPaused ? 'Resume sync' : 'Pause sync'}
+                  {replicationPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+                  {replicationPaused ? 'Resume replication' : 'Pause replication'}
                 </button>
               )}
-              {devMode && (
-                <div className="mt-2 text-xs text-blue-700">The sync daemon runs on the production VPS only.</div>
+              {!replicationReady && (
+                <div className="mt-2 text-xs text-blue-700">Streaming replication runs on the production VPS only.</div>
               )}
             </div>
 
@@ -505,13 +557,13 @@ export default function SystemHealth() {
           <div className="rounded-xl border border-gray-200 bg-white p-4">
             <div className="flex items-center gap-2 text-sm font-semibold text-gray-800 mb-3">
               <History className="w-4 h-4 text-gray-500" />
-              Incident &amp; sync timeline (latest 20)
+              Incident &amp; replication timeline (latest 20)
             </div>
             {timeline.length === 0 ? (
               <div className="text-xs text-gray-400 py-2">
                 {devMode
                   ? 'No events on this machine — incident logging runs with the standby setup on production.'
-                  : 'No events recorded yet — sync runs every 2 minutes and will populate this feed.'}
+                  : 'No events recorded yet — failover and replication changes appear here.'}
               </div>
             ) : (
               <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">

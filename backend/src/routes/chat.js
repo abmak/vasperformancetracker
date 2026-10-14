@@ -466,7 +466,7 @@ router.delete('/messages/:id', async (req, res) => {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     }
 
-    await pool.execute('UPDATE chat_messages SET is_deleted = 1, message_text = "" WHERE id = ?', [req.params.id]);
+    await pool.execute("UPDATE chat_messages SET is_deleted = 1, message_text = '' WHERE id = ?", [req.params.id]);
     res.json({ message: 'Message deleted' });
   } catch (error) {
     res.status(500).json({ error: error.message });

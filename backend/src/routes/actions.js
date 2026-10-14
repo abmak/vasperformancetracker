@@ -134,9 +134,8 @@ async function getAssigneeIds(actionId) {
 // GET all action notes with latest history
 router.get('/', async (req, res) => {
   try {
-    // Auto-expire actions where target_date has passed
     await pool.query(
-      "UPDATE action_notes SET status='expired' WHERE target_date IS NOT NULL AND target_date < CURDATE() AND status IN ('planned', 'in_progress')"
+      "UPDATE action_notes SET status='expired' WHERE target_date IS NOT NULL AND target_date < CURRENT_DATE AND status IN ('planned', 'in_progress')"
     );
 
     const { service_name, action_type, status, revenue_month } = req.query;
@@ -173,9 +172,8 @@ router.get('/', async (req, res) => {
 // GET single action with full history
 router.get('/:id', async (req, res) => {
   try {
-    // Auto-expire this action if needed
     await pool.query(
-      "UPDATE action_notes SET status='expired' WHERE id=? AND target_date IS NOT NULL AND target_date < CURDATE() AND status IN ('planned', 'in_progress')",
+      "UPDATE action_notes SET status='expired' WHERE id=? AND target_date IS NOT NULL AND target_date < CURRENT_DATE AND status IN ('planned', 'in_progress')",
       [req.params.id]
     );
 

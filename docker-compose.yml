@@ -2,8 +2,9 @@
 #
 # Host networking (Linux) keeps everything identical to the pm2 setup:
 #   - the API listens on 127.0.0.1:5001 (vas-https proxies TLS :5000 → it)
-#   - the app reaches the system MySQL at 127.0.0.1:3306 and the standby
-#     failover layer works with the same 127.0.0.1:3307 addresses
+#   - the app reaches PostgreSQL at 127.0.0.1:5432, and the failover layer
+#     reaches the streaming standby at 127.0.0.1:5433 (see
+#     docker-compose.pg.yml, which runs both servers)
 #
 # Prerequisites (one-time):
 #   1. Docker installed:            sudo bash scripts/docker/install-docker-vps.sh
@@ -18,9 +19,10 @@
 #   docker compose -f /var/www/performancetracking/app/docker-compose.yml down
 #   pm2 start perf-tracking-api
 #
-# NOTE: the failover marker path is shared with the host sync daemon
-# (~/mysql-standby) so the containerized app and the daemon agree on
-# failover state.
+# NOTE: the failover marker (~/pg-standby/FAILOVER, plus PROMOTED once a
+# standby has been promoted) is shared with the host so the containerized app
+# and the operator's scripts agree on failover state. The old ~/mysql-standby
+# mount stays for the MySQL rollback window.
 
 name: perf-tracking
 
@@ -33,9 +35,9 @@ services:
       - /var/www/performancetracking/app/backend/.env.production
     environment:
       # Inside the container $HOME is /home/node — pin these to the shared,
-      # host-mounted locations so the app sees the same state as the host
-      # sync daemon (db-sync) and the host-side backup scripts.
-      DB_FAILOVER_MARKER: /home/feveneyasu/mysql-standby/FAILOVER
+      # host-mounted locations so the app sees the same state as the host-side
+      # failover helpers and the host-side backup scripts.
+      DB_FAILOVER_MARKER: /home/feveneyasu/pg-standby/FAILOVER
       DB_SYNC_STATUS_FILE: /home/feveneyasu/mysql-standby/status.json
       BACKUPS_DIR: /home/feveneyasu/backups
       PORT: 5001
@@ -43,7 +45,10 @@ services:
       # persistent user uploads (chat media) + ACME challenges
       - /var/www/performancetracking/app/backend/uploads:/app/backend/uploads
       - /var/www/performancetracking/app/backend/acme-challenges:/app/backend/acme-challenges
-      # shared failover marker + sync status with the host-side sync daemon
+      # failover marker shared with the host-side scripts (writable: the app
+      # creates the marker the moment it fails over)
+      - /home/feveneyasu/pg-standby:/home/feveneyasu/pg-standby
+      # legacy MySQL sync daemon status (kept for the rollback window)
       - /home/feveneyasu/mysql-standby:/home/feveneyasu/mysql-standby
       # backups (nightly dumps + standby snapshots) — read-only, the
       # System Health page only reads them

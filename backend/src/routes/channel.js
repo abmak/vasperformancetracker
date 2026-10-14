@@ -524,7 +524,7 @@ router.get('/dashboard/kpis', async (req, res) => {
          FROM channel_entities e
          LEFT JOIN channel_stock_balances b ON b.entity_id = e.id AND ${stock.sql}
         WHERE ${present.sql}
-        GROUP BY product ORDER BY entities DESC LIMIT 50`,
+        GROUP BY 1 ORDER BY entities DESC LIMIT 50`,
       [...stock.params, ...present.params]
     );
 
@@ -536,7 +536,7 @@ router.get('/dashboard/kpis', async (req, res) => {
          FROM channel_entities e
          LEFT JOIN channel_stock_balances b ON b.entity_id = e.id AND ${stock.sql}
         WHERE ${present.sql}
-        GROUP BY business_type ORDER BY entities DESC LIMIT 50`,
+        GROUP BY 1 ORDER BY entities DESC LIMIT 50`,
       [...stock.params, ...present.params]
     );
 

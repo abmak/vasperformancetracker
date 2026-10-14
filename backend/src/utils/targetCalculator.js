@@ -46,12 +46,9 @@ async function ensureTargetAllocationSchema() {
     }
   }
   try {
-    // Plain ADD COLUMN — MySQL (unlike MariaDB) does not support
-    // "ADD COLUMN IF NOT EXISTS"; the duplicate-column error when the column
-    // already exists is expected and ignored.
-    await pool.execute(`ALTER TABLE revenue_targets ADD COLUMN allocation_mode ENUM('automatic','manual') NOT NULL DEFAULT 'automatic'`);
+    await pool.execute(`ALTER TABLE revenue_targets ADD COLUMN IF NOT EXISTS allocation_mode VARCHAR(50) DEFAULT 'automatic'`);
   } catch (e) {
-    if (e.code !== 'ER_DUP_FIELDNAME' && e.errno !== 1060) {
+    if (e.code !== 'ER_DUP_FIELDNAME' && e.errno !== 1060 && e.code !== '42701') {
       console.error('[targetCalculator] allocation_mode column check failed:', e.message);
     }
   }

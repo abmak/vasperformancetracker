@@ -1,0 +1,106 @@
+# PostgreSQL for the VAS Performance Tracker.
+#
+# Same two-door layout the MySQL setup had (primary 3306 / standby 3307), so the
+# app's failover layer works unchanged:
+#
+#   pg-primary   127.0.0.1:5432   ← the app writes here
+#   pg-standby   127.0.0.1:5433   ← streaming replica, read-only until promoted
+#
+# Both publish on the loopback interface ONLY — PostgreSQL must never be
+# reachable from the network, whatever the VPS firewall does.
+#
+# Secrets live in .env.pg (chmod 600, never committed):
+#   PG_SUPERUSER_PASSWORD, PG_REPLICATION_PASSWORD, PG_APP_PASSWORD
+#
+#   docker compose --env-file .env.pg -f docker-compose.pg.yml up -d
+#
+# The standby is not created by `up` — it is cloned from the primary by
+# scripts/db/pg-setup-replication.sh (see the runbook in scripts/db).
+#
+# The app container uses host networking, so 127.0.0.1:5432 reaches the primary
+# exactly like the old MySQL socket did.
+
+name: ${PG_PROJECT:-perf-tracking-pg}
+
+services:
+  pg-primary:
+    image: postgres:18-alpine
+    container_name: pg-primary
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PG_PRIMARY_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${PG_DATABASE:-vas_revenue_tracking}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD:?set PG_SUPERUSER_PASSWORD in .env.pg}
+      # Consumed by pg-init/01-replication.sh on first initialisation only.
+      POSTGRES_REPLICATION_PASSWORD: ${PG_REPLICATION_PASSWORD:?set PG_REPLICATION_PASSWORD in .env.pg}
+      POSTGRES_APP_PASSWORD: ${PG_APP_PASSWORD:?set PG_APP_PASSWORD in .env.pg}
+      PG_APP_USER: ${PG_APP_USER:-vas_app}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./scripts/db/pg-init:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      - -c
+      - hot_standby=on
+      # The VPS has ~4 GB RAM shared with MySQL and the app; keep the buffer
+      # pool deliberately modest instead of taking PostgreSQL's defaults.
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - max_connections=60
+      - -c
+      - listen_addresses=*
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${PG_DATABASE:-vas_revenue_tracking}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  pg-standby:
+    image: postgres:18-alpine
+    container_name: pg-standby
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PG_STANDBY_PORT:-5433}:5432"
+    environment:
+      # Not used once the data directory has been cloned (the entrypoint only
+      # initialises an empty directory), but the image expects something set.
+      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD:?set PG_SUPERUSER_PASSWORD in .env.pg}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg-standby-data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - hot_standby=on
+      - -c
+      - listen_addresses=*
+      - -c
+      - primary_conninfo=host=pg-primary port=5432 user=replicator password=${PG_REPLICATION_PASSWORD:?set PG_REPLICATION_PASSWORD in .env.pg} application_name=standby
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pg-primary-data:
+  pg-standby-data:
