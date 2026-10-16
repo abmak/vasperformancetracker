@@ -94,11 +94,17 @@ const TIER_COLORS = {
   gray: { border: 'border-gray-200', bg: 'bg-gray-50', icon: 'text-gray-400', chip: 'bg-gray-100 text-gray-500' },
 };
 
-// One card per cadence, mirroring the retention in scripts/db/pg-backup.sh.
+// One card per cadence, mirroring the retention in scripts/db/pg-backup.sh and
+// the cron entries on the server.
+//
+// The titles name BOTH the engine and the schedule on purpose: these are
+// PostgreSQL pg_dump tiers driven by the server's own crontab, so they must not
+// be readable as the app's copy-cadence setting — that one governs the legacy
+// MySQL standby copy and cannot change these cards.
 const BACKUP_TIER_CARDS = [
-  { key: 'tenMin', title: '10-minute backup', icon: Timer, accent: 'tenMin', retention: 'last hour (6)' },
-  { key: 'hourly', title: 'Hourly backup', icon: Clock, accent: 'hourly', retention: 'last day (24)' },
-  { key: 'nightly', title: 'Nightly backup', icon: Archive, accent: 'nightly', retention: 'last 14 days' },
+  { key: 'tenMin', title: 'PostgreSQL dump · every 10 min', icon: Timer, accent: 'tenMin', retention: 'last hour (6)', schedule: 'cron */10 * * * *' },
+  { key: 'hourly', title: 'PostgreSQL dump · hourly', icon: Clock, accent: 'hourly', retention: 'last day (24)', schedule: 'cron 5 * * * *' },
+  { key: 'nightly', title: 'PostgreSQL dump · nightly', icon: Archive, accent: 'nightly', retention: 'last 14 days', schedule: 'cron 15 2 * * *' },
 ];
 
 /**
@@ -107,7 +113,7 @@ const BACKUP_TIER_CARDS = [
  * Split out from StatusCard so each tier carries its own colour: a fresh
  * 10-minute dump must never make a nightly tier that stopped days ago look fine.
  */
-function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, newest, count, emptyText }) {
+function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, newest, count, schedule, emptyText }) {
   const palette = TIER_COLORS[up === true ? accent : up === false ? 'red' : 'gray'] || TIER_COLORS.gray;
   return (
     <div className={`rounded-xl border shadow-sm p-4 ${palette.border} ${palette.bg}`}>
@@ -131,6 +137,7 @@ function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, n
                 : 'none yet'}
             </div>
             <div>{count} file(s) kept{retention ? ` · ${retention}` : ''}</div>
+            {schedule && <div className="text-[10px] text-gray-400">{schedule}</div>}
           </>
         )}
       </div>
@@ -542,7 +549,7 @@ export default function SystemHealth() {
               stale tier is visible without reading the numbers. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             {backup?.tiers ? (
-              BACKUP_TIER_CARDS.map(({ key, title, icon, accent, retention }) => (
+              BACKUP_TIER_CARDS.map(({ key, title, icon, accent, retention, schedule }) => (
                 <BackupTierCard
                   key={key}
                   title={title}
@@ -550,6 +557,7 @@ export default function SystemHealth() {
                   accent={accent}
                   up={devMode ? null : (backup.tiers[key]?.ok ?? null)}
                   retention={retention}
+                  schedule={schedule}
                   newest={backup.tiers[key]?.newest || null}
                   count={backup.tiers[key]?.count ?? 0}
                 />
@@ -670,17 +678,19 @@ export default function SystemHealth() {
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
                   <Timer className="w-4 h-4 text-gray-500" />
-                  Standby copy cadence
+                  MySQL standby copy cadence
                 </div>
                 <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
                   every {copyMinutes} min
                 </span>
               </div>
               <p className="mt-2 text-xs text-gray-500">
-                How often the retained MySQL standby is re-copied wholesale as the rollback path. The
-                PostgreSQL standby the app serves from streams WAL continuously and has no interval — this
-                setting does not slow that down. A new value is picked up within about a minute, with no
-                daemon restart.
+                How often the retained <span className="font-medium text-gray-700">MySQL</span> standby is
+                re-copied wholesale as the rollback path. This is the only thing this setting controls: the
+                PostgreSQL standby the app serves from streams WAL continuously, and the three PostgreSQL
+                dump cards on this page run from the server's own cron at their own fixed schedules —
+                neither follows this value. A new cadence is picked up within about a minute, with no daemon
+                restart.
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 <input
@@ -790,8 +800,10 @@ export default function SystemHealth() {
             Failover/failback events notify master admins automatically and appear in the timeline above.
             {' '}Separately, the retained MySQL standby is still copied whole every{' '}
             <span className="font-semibold text-gray-700">{copyMinutes} minutes</span>
-            {' '}({standbySync?.source === 'config' ? 'your saved cadence' : 'the built-in default'}) as the
-            rollback path. Status refreshes every 15 seconds while this page is open.
+            {' '}({standbySync?.source === 'config' ? 'your saved cadence' : 'the built-in default'}) as its
+            rollback path — that is the <em>only</em> copy cadence this page controls; the PostgreSQL dump
+            cards above run from the server's own cron at their own schedules. Status refreshes every 15
+            seconds while this page is open.
           </div>
         </>
       )}
