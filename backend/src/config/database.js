@@ -42,6 +42,10 @@ const PROMOTED_FILE = process.env.DB_PROMOTED_MARKER
 const CONNECTION_CONFIG_FILE = process.env.DB_CONNECTION_CONFIG_FILE
   || path.join(path.dirname(MARKER_FILE), 'connection-config.json');
 const CONNECT_TIMEOUT_LIMITS = { minSeconds: 1, maxSeconds: 120, defaultSeconds: 10 };
+// The config file is shared with the host, so it can also change without this
+// process knowing — poll it the way the sync daemon does, and a change lands
+// within a minute with no restart. Overridable for tests.
+const CONNECTION_POLL_MS = Number(process.env.DB_CONNECTION_POLL_MS) || 60000;
 
 /**
  * The connection attempt timeout in force, and where it came from.
@@ -89,6 +93,8 @@ function makePool(host, port) {
 
 const pools = { primary: makePool(PRIMARY_HOST, PRIMARY_PORT) };
 if (STANDBY_ENABLED) pools.standby = makePool(STANDBY_HOST, STANDBY_PORT);
+console.log('[db-failover] connection attempt timeout: ' + connectionConfig.ms + 'ms (source: '
+  + connectionConfig.source + ')');
 
 // A pg Pool re-emits a failure of an *idle* client as an 'error' event on the
 // pool itself, and an unhandled 'error' event tears the whole process down.
@@ -162,6 +168,10 @@ function reconcileConnectionTimeout() {
   connectionConfig = next;
   return { changed, ...connectionTimeoutState() };
 }
+
+// unref() so this timer never holds the process open on shutdown.
+const connectionPoll = setInterval(reconcileConnectionTimeout, CONNECTION_POLL_MS);
+if (connectionPoll.unref) connectionPoll.unref();
 
 /**
  * The failover marker file is the app's memory of "we are not on the primary":
