@@ -21,7 +21,7 @@ during the rollback window.
 | `scripts/db/pg-setup-replication.sh` | clones the primary into the standby (`pg_basebackup`) and starts streaming |
 | `scripts/db/migrate-mysql-to-postgres.js` | one-shot data migration (45 tables, verified row counts) |
 | `scripts/db/setup-postgres-functions.js`<br>`scripts/db/setup-postgres-compat-layer.js` | MySQL-compat functions/operators the legacy SQL relies on (needs superuser) |
-| `scripts/db/pg-backup.sh` | tiered `pg_dump` → `~/backups/vas-pg*.sql.gz` (10-min / hourly / nightly + retention) |
+| `scripts/db/pg-backup.sh` | tiered `pg_dump` → `~/backups/vas-pg*.sql.gz` (frequent / hourly / nightly + retention; the frequent interval is configurable from System Health) |
 
 Secrets live in `.env.pg` next to the compose file (chmod 600):
 
@@ -90,18 +90,29 @@ are kept, so there is always a restore point that is minutes, hours and days old
 
 | Tier | Runs | File | Kept | Recovers from |
 | --- | --- | --- | --- | --- |
-| 10-minute | `*/10 * * * *` | `vas-pg-10m-<date>-<HHMM>.sql.gz` | newest 6 (1 hour) | a mistake made minutes ago |
+| frequent | `* * * * *`, due-gated | `vas-pg-10m-<date>-<HHMM>.sql.gz` | ~1 hour of dumps | a mistake made minutes ago |
 | hourly | `5 * * * *` | `vas-pg-hourly-<date>-<HH>.sql.gz` | newest 24 (1 day) | something noticed later today |
 | nightly | `15 2 * * *` | `vas-pg-<date>.sql.gz` | 14 days | anything from the past fortnight |
 
+The frequent tier's cron fires every minute and the script decides whether it is
+**due**, so its interval is a setting rather than a cron expression: the master
+admin changes it on System Health → the frequent dump card, which writes
+`~/pg-standby/backup-config.json` and the next run picks it up (within a minute,
+no redeploy). Bounds are 1–60 minutes; the default is 10. Retention follows the
+interval (about an hour's worth, 6 files at the default), and a `.pg-backup-10m.last`
+stamp in `~/backups` records the last completed dump so a late or missed cron
+minute cannot double-dump or stretch the gap. The `10m` prefix in the file name
+is the tier's stable id, not its interval.
+
 ```bash
-bash scripts/db/pg-backup.sh --tier=10m      # manual run of one tier
+bash scripts/db/pg-backup.sh --tier=10m      # manual run of one tier (resets the due clock)
+bash scripts/db/pg-backup.sh --tier=10m --dry-run   # say whether it is due, without dumping
 bash scripts/db/pg-backup.sh                 # no argument = nightly (as before)
-crontab -l                                   # */10, 5 * * *, 15 2 * * *
+crontab -l                                   # * * * * *, 5 * * *, 15 2 * * *
 ```
 
-Steady-state footprint is small: each dump is ~2.1 MB, so 6 + 24 + 14 files ≈
-95 MB. Retention is per tier, and the nightly `-mtime` prune is scoped to
+Steady-state footprint is small: each dump is ~2.1 MB, so ~60 files ≈ 95 MB
+(the frequent tier always keeps about an hour's worth, whatever its interval). Retention is per tier, and the nightly `-mtime` prune is scoped to
 `vas-pg-YYYY-MM-DD` names so it can never sweep away the shorter tiers.
 
 The script picks whichever container is **out of recovery**, so a backup taken

@@ -94,18 +94,28 @@ const TIER_COLORS = {
   gray: { border: 'border-gray-200', bg: 'bg-gray-50', icon: 'text-gray-400', chip: 'bg-gray-100 text-gray-500' },
 };
 
-// One card per cadence, mirroring the retention in scripts/db/pg-backup.sh and
-// the cron entries on the server.
+// One card per dump tier, mirroring scripts/db/pg-backup.sh and the cron entries
+// on the server.
 //
 // The titles name BOTH the engine and the schedule on purpose: these are
-// PostgreSQL pg_dump tiers driven by the server's own crontab, so they must not
-// be readable as the app's copy-cadence setting — that one governs the legacy
-// MySQL standby copy and cannot change these cards.
-const BACKUP_TIER_CARDS = [
-  { key: 'tenMin', title: 'PostgreSQL dump · every 10 min', icon: Timer, accent: 'tenMin', retention: 'last hour (6)', schedule: 'cron */10 * * * *' },
-  { key: 'hourly', title: 'PostgreSQL dump · hourly', icon: Clock, accent: 'hourly', retention: 'last day (24)', schedule: 'cron 5 * * * *' },
-  { key: 'nightly', title: 'PostgreSQL dump · nightly', icon: Archive, accent: 'nightly', retention: 'last 14 days', schedule: 'cron 15 2 * * *' },
-];
+// PostgreSQL pg_dump tiers driven by the server's own cron, so they must not be
+// readable as the MySQL standby copy cadence, which is a different backup
+// entirely. The frequent tier's title follows its configured interval — the card
+// and the dumps can never disagree, because both read the same setting.
+function backupTierCards(intervalMinutes, keepFiles) {
+  return [
+    {
+      key: 'tenMin',
+      title: `PostgreSQL dump · every ${intervalMinutes} min`,
+      icon: Timer,
+      accent: 'tenMin',
+      retention: `newest ${keepFiles} (~1 hour)`,
+      schedule: `cron every minute · dumps when ${intervalMinutes} min have passed`,
+    },
+    { key: 'hourly', title: 'PostgreSQL dump · hourly', icon: Clock, accent: 'hourly', retention: 'last day (24)', schedule: 'cron 5 * * * *' },
+    { key: 'nightly', title: 'PostgreSQL dump · nightly', icon: Archive, accent: 'nightly', retention: 'last 14 days', schedule: 'cron 15 2 * * *' },
+  ];
+}
 
 /**
  * BackupTierCard — one backup tier, on its own card.
@@ -113,7 +123,7 @@ const BACKUP_TIER_CARDS = [
  * Split out from StatusCard so each tier carries its own colour: a fresh
  * 10-minute dump must never make a nightly tier that stopped days ago look fine.
  */
-function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, newest, count, schedule, emptyText }) {
+function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, newest, count, schedule, control, emptyText }) {
   const palette = TIER_COLORS[up === true ? accent : up === false ? 'red' : 'gray'] || TIER_COLORS.gray;
   return (
     <div className={`rounded-xl border shadow-sm p-4 ${palette.border} ${palette.bg}`}>
@@ -140,6 +150,7 @@ function BackupTierCard({ title, icon: Icon, accent = 'tenMin', up, retention, n
             {schedule && <div className="text-[10px] text-gray-400">{schedule}</div>}
           </>
         )}
+        {control}
       </div>
     </div>
   );
@@ -159,6 +170,10 @@ export default function SystemHealth() {
   const [timeoutDraft, setTimeoutDraft] = useState('');
   const [timeoutDirty, setTimeoutDirty] = useState(false);
   const [timeoutBusy, setTimeoutBusy] = useState(false);
+  // Frequent PostgreSQL dump cadence (minutes)
+  const [dumpDraft, setDumpDraft] = useState('');
+  const [dumpDirty, setDumpDirty] = useState(false);
+  const [dumpBusy, setDumpBusy] = useState(false);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -228,6 +243,25 @@ export default function SystemHealth() {
     }
   }, [timeoutDraft, load]);
 
+  const saveDumpInterval = useCallback(async () => {
+    const minutes = Number(dumpDraft);
+    if (!Number.isInteger(minutes)) {
+      toast.error('Enter a whole number of minutes');
+      return;
+    }
+    setDumpBusy(true);
+    try {
+      const r = await systemAPI.setBackupInterval(minutes);
+      toast.success(`Dump cadence saved: a PostgreSQL dump every ${r.minutes} min, keeping the newest ${r.keepFiles} — the backup cron picks it up within ${r.pickupSeconds}s`);
+      setDumpDirty(false);
+      await load();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setDumpBusy(false);
+    }
+  }, [dumpDraft, load]);
+
   useEffect(() => {
     load();
   }, [load]);
@@ -296,6 +330,21 @@ export default function SystemHealth() {
     if (!connTimeout || timeoutDirty) return;
     setTimeoutDraft(String(connTimeout.seconds));
   }, [connTimeout, timeoutDirty]);
+
+  // The frequent PostgreSQL dump's cadence — the restore-point spacing. Its card
+  // reads nothing else for its title, so the card and the dumps always agree.
+  const dumpInterval = data?.backupInterval;
+  const dumpMinutes = dumpInterval?.minutes ?? 10;
+  const dumpKeep = dumpInterval?.keepFiles ?? 6;
+  const dumpIsSaved = dumpInterval?.source === 'config';
+  const dumpSource = dumpIsSaved
+    ? `saved by ${dumpInterval.updatedBy || 'a master admin'}${dumpInterval.updatedAt ? ' · ' + new Date(dumpInterval.updatedAt).toLocaleString() : ''}`
+    : 'built-in default — nobody has set one yet';
+
+  useEffect(() => {
+    if (!dumpInterval || dumpDirty) return;
+    setDumpDraft(String(dumpInterval.minutes));
+  }, [dumpInterval, dumpDirty]);
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -549,7 +598,7 @@ export default function SystemHealth() {
               stale tier is visible without reading the numbers. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             {backup?.tiers ? (
-              BACKUP_TIER_CARDS.map(({ key, title, icon, accent, retention, schedule }) => (
+              backupTierCards(dumpMinutes, dumpKeep).map(({ key, title, icon, accent, retention, schedule }) => (
                 <BackupTierCard
                   key={key}
                   title={title}
@@ -560,6 +609,37 @@ export default function SystemHealth() {
                   schedule={schedule}
                   newest={backup.tiers[key]?.newest || null}
                   count={backup.tiers[key]?.count ?? 0}
+                  control={key === 'tenMin' ? (
+                    /* The cadence control lives on the card it changes, so the
+                       setting and the schedule it drives are one object. */
+                    <div className="mt-3 pt-3 border-t border-gray-200/70">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="number"
+                          min={dumpInterval?.minMinutes ?? 1}
+                          max={dumpInterval?.maxMinutes ?? 60}
+                          value={dumpDraft}
+                          onChange={(e) => { setDumpDraft(e.target.value); setDumpDirty(true); }}
+                          className="w-20 px-2.5 py-1.5 text-sm rounded-lg border border-gray-200 bg-white focus:border-emerald-500 focus:outline-none"
+                        />
+                        <span className="text-xs text-gray-500">
+                          minutes ({dumpInterval?.minMinutes ?? 1}–{dumpInterval?.maxMinutes ?? 60})
+                        </span>
+                        <button
+                          onClick={saveDumpInterval}
+                          disabled={dumpBusy || !dumpDirty}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                        >
+                          {dumpBusy && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                          Save
+                        </button>
+                        {dumpDirty && <span className="text-xs text-amber-700">unsaved</span>}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500">
+                        how often this dump runs · {dumpSource}
+                      </div>
+                    </div>
+                  ) : null}
                 />
               ))
             ) : (
@@ -686,11 +766,11 @@ export default function SystemHealth() {
               </div>
               <p className="mt-2 text-xs text-gray-500">
                 How often the retained <span className="font-medium text-gray-700">MySQL</span> standby is
-                re-copied wholesale as the rollback path. This is the only thing this setting controls: the
-                PostgreSQL standby the app serves from streams WAL continuously, and the three PostgreSQL
-                dump cards on this page run from the server's own cron at their own fixed schedules —
-                neither follows this value. A new cadence is picked up within about a minute, with no daemon
-                restart.
+                re-copied wholesale as the rollback path. This is the only thing this setting controls.
+                It does <span className="font-medium text-gray-700">not</span> set how often PostgreSQL is
+                backed up: the standby the app serves from streams WAL continuously, and the dump cards
+                above keep their own schedules (the frequent one has its own setting on its card). A new
+                value here is picked up within about a minute, with no daemon restart.
               </p>
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 <input
@@ -801,9 +881,9 @@ export default function SystemHealth() {
             {' '}Separately, the retained MySQL standby is still copied whole every{' '}
             <span className="font-semibold text-gray-700">{copyMinutes} minutes</span>
             {' '}({standbySync?.source === 'config' ? 'your saved cadence' : 'the built-in default'}) as its
-            rollback path — that is the <em>only</em> copy cadence this page controls; the PostgreSQL dump
-            cards above run from the server's own cron at their own schedules. Status refreshes every 15
-            seconds while this page is open.
+            rollback path — a different backup from the PostgreSQL dump cards above, whose frequent tier has
+            its own cadence setting on its card (the hourly and nightly tiers stay on fixed cron times).
+            Status refreshes every 15 seconds while this page is open.
           </div>
         </>
       )}

@@ -38,6 +38,8 @@ services:
       # host-mounted locations so the app sees the same state as the host-side
       # failover helpers and the host-side backup scripts.
       DB_FAILOVER_MARKER: /home/feveneyasu/pg-standby/FAILOVER
+      # the frequent-dump cadence the host's cron reads on every run
+      DB_BACKUP_CONFIG_FILE: /home/feveneyasu/pg-standby/backup-config.json
       DB_SYNC_STATUS_FILE: /home/feveneyasu/mysql-standby/status.json
       BACKUPS_DIR: /home/feveneyasu/backups
       PORT: 5001

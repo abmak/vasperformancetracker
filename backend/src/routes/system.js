@@ -44,6 +44,56 @@ const CONNECT_TIMEOUT_LIMITS = db.__connectTimeoutLimits || {
   minSeconds: 1, maxSeconds: 120, defaultSeconds: 10,
 };
 
+// How often the frequent PostgreSQL dump tier actually runs, and its retention.
+//
+// The dump itself is done by scripts/db/pg-backup.sh on the host's cron (this
+// process can neither dump nor reach the host's crontab), so the cadence is
+// handed over in a file the script reads on every run — the host needs no
+// redeploy to change it. Bounds are shared with the script's (MIN_INTERVAL /
+// MAX_INTERVAL there) so a value accepted here is never rejected on the host.
+const BACKUP_CONFIG_FILE = process.env.DB_BACKUP_CONFIG_FILE
+  || path.join(
+    process.env.DB_FAILOVER_MARKER ? path.dirname(process.env.DB_FAILOVER_MARKER) : path.join(HOME, 'pg-standby'),
+    'backup-config.json'
+  );
+const BACKUP_INTERVAL_LIMITS = { minMinutes: 1, maxMinutes: 60, defaultMinutes: 10 };
+// The tier's cron line runs every minute, so a saved change is acted on within
+// one minute without touching the host.
+const BACKUP_INTERVAL_PICKUP_SECONDS = 60;
+
+/**
+ * The saved dump cadence, or the built-in default.
+ *
+ * `source` is reported rather than guessed: 'default' means nobody has chosen a
+ * value, so the card never claims a cadence the operator did not set.
+ */
+function backupIntervalConfig() {
+  const cfg = readJsonSafe(BACKUP_CONFIG_FILE);
+  const minutes = Number(cfg && cfg.intervalMinutes);
+  if (Number.isInteger(minutes)
+    && minutes >= BACKUP_INTERVAL_LIMITS.minMinutes
+    && minutes <= BACKUP_INTERVAL_LIMITS.maxMinutes) {
+    return {
+      minutes,
+      source: 'config',
+      updatedAt: cfg.updatedAt || null,
+      updatedBy: cfg.updatedBy || null,
+    };
+  }
+  return {
+    minutes: BACKUP_INTERVAL_LIMITS.defaultMinutes,
+    source: 'default',
+    updatedAt: null,
+    updatedBy: null,
+  };
+}
+
+// About an hour of dumps at the current cadence — the same rule the script
+// applies, so the card's retention line matches what really gets kept.
+function backupKeepCount(minutes) {
+  return Math.max(2, Math.ceil(60 / minutes));
+}
+
 function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
@@ -251,15 +301,25 @@ function tlsCertExpiry() {
 //
 // The legacy MySQL names (vas-<date>.sql.gz) are still counted so the card keeps
 // working during the MySQL rollback window instead of flashing "no backups".
-const BACKUP_TIERS = [
-  // key, name prefix/pattern, label, and how stale the tier may get before it
-  // counts as broken (a missed 10-minute run must not hide in a green card).
-  { key: 'tenMin', match: (n) => n.startsWith('vas-pg-10m-'), label: 'every 10 min', maxAgeHours: 0.5 },
-  { key: 'hourly', match: (n) => n.startsWith('vas-pg-hourly-'), label: 'hourly', maxAgeHours: 2 },
-  { key: 'nightly', match: (n) => /^vas-pg-\d{4}-\d{2}-\d{2}\.sql\.gz$/.test(n), label: 'nightly', maxAgeHours: 26 },
-];
+function backupTiers(intervalMinutes) {
+  return [
+    // key, name prefix/pattern, label, and how stale the tier may get before it
+    // counts as broken (a missed frequent run must not hide in a green card).
+    // The frequent tier's label and threshold follow the configured cadence:
+    // 1.5 intervals of silence means a run was missed, whatever the interval is.
+    {
+      key: 'tenMin',
+      match: (n) => n.startsWith('vas-pg-10m-'),
+      label: `every ${intervalMinutes} min`,
+      maxAgeHours: (intervalMinutes / 60) * 1.5,
+    },
+    { key: 'hourly', match: (n) => n.startsWith('vas-pg-hourly-'), label: 'hourly', maxAgeHours: 2 },
+    { key: 'nightly', match: (n) => /^vas-pg-\d{4}-\d{2}-\d{2}\.sql\.gz$/.test(n), label: 'nightly', maxAgeHours: 26 },
+  ];
+}
 
-function backupCheck() {
+function backupCheck(intervalMinutes) {
+  const tiersForRun = backupTiers(intervalMinutes);
   try {
     const files = fs.readdirSync(BACKUPS_DIR)
       .filter((f) => /^vas(-pg)?-.*\.sql\.gz$/.test(f))
@@ -277,7 +337,7 @@ function backupCheck() {
 
     // files are newest-first, so [0] of each tier is that tier's newest dump.
     const tiers = {};
-    for (const t of BACKUP_TIERS) {
+    for (const t of tiersForRun) {
       const own = files.filter((f) => t.match(f.name));
       const newestOfTier = own[0] || null;
       const ageHours = newestOfTier ? Number(ageHoursOf(newestOfTier).toFixed(2)) : null;
@@ -489,7 +549,8 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
       Promise.resolve(snapshotCheck()),
     ]);
 
-    const backup = backupCheck();
+    const dumpInterval = backupIntervalConfig();
+    const backup = backupCheck(dumpInterval.minutes);
     const standbySync = syncIntervalConfig();
 
     res.json({
@@ -557,6 +618,18 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
         minMinutes: SYNC_INTERVAL_LIMITS.minMinutes,
         maxMinutes: SYNC_INTERVAL_LIMITS.maxMinutes,
         pickupSeconds: SYNC_INTERVAL_PICKUP_SECONDS,
+      },
+      // How often the frequent PostgreSQL dump runs, and where that came from.
+      // The label, threshold and retention on the backup card all follow it, so
+      // the card can never advertise a cadence the dumps do not use.
+      backupInterval: {
+        ...dumpInterval,
+        minMinutes: BACKUP_INTERVAL_LIMITS.minMinutes,
+        maxMinutes: BACKUP_INTERVAL_LIMITS.maxMinutes,
+        defaultMinutes: BACKUP_INTERVAL_LIMITS.defaultMinutes,
+        keepFiles: backupKeepCount(dumpInterval.minutes),
+        configFile: BACKUP_CONFIG_FILE,
+        pickupSeconds: BACKUP_INTERVAL_PICKUP_SECONDS,
       },
       server: stats,
       cpu,
@@ -723,6 +796,56 @@ router.put('/connection-timeout', requireMasterAdmin, async (req, res) => {
   } catch (e) { /* best-effort audit trail */ }
 
   res.json({ ok: true, ...applied, previousSeconds: previous.seconds });
+});
+
+// Frequent PostgreSQL dump cadence — the restore-point spacing.
+//
+// The dump runs on the host's cron (this process cannot dump, and cannot reach
+// the host's crontab), so the interval is saved to a file that scripts/db/pg-backup.sh
+// reads on each run. That cron fires every minute and the script decides whether
+// it is due, which is what makes any interval possible without a host change.
+router.put('/backup-interval', requireMasterAdmin, async (req, res) => {
+  const { minMinutes, maxMinutes } = BACKUP_INTERVAL_LIMITS;
+  const minutes = Number(req.body ? req.body.minutes : undefined);
+  if (!Number.isInteger(minutes) || minutes < minMinutes || minutes > maxMinutes) {
+    return res.status(400).json({
+      error: `minutes must be a whole number between ${minMinutes} and ${maxMinutes}`,
+    });
+  }
+
+  const previous = backupIntervalConfig();
+  const updatedBy = (req.user && (req.user.email || req.user.username)) || 'master admin';
+  const payload = { intervalMinutes: minutes, updatedAt: new Date().toISOString(), updatedBy };
+
+  // Write-then-rename: the host script reads this file on every run and must
+  // never catch it half-written, which would look like "no config at all".
+  const tmp = BACKUP_CONFIG_FILE + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(BACKUP_CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, BACKUP_CONFIG_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* nothing to clean up */ }
+    console.error('[system-backup-interval]', e);
+    return res.status(500).json({ error: 'could not save ' + BACKUP_CONFIG_FILE + ': ' + e.message });
+  }
+
+  const applied = backupIntervalConfig();
+  try {
+    await recordFailoverEvent(
+      'INFO',
+      `PostgreSQL dump interval changed ${previous.minutes} min → ${applied.minutes} min by ${updatedBy}`,
+      { configFile: BACKUP_CONFIG_FILE, previousSource: previous.source, keepFiles: backupKeepCount(applied.minutes) }
+    );
+  } catch (e) { /* best-effort audit trail */ }
+
+  res.json({
+    ok: true,
+    ...applied,
+    previousMinutes: previous.minutes,
+    keepFiles: backupKeepCount(applied.minutes),
+    pickupSeconds: BACKUP_INTERVAL_PICKUP_SECONDS,
+  });
 });
 
 module.exports = router;

@@ -15,9 +15,17 @@
 #
 # Install on the VPS (replacing the old mysqldump line — keep that one too while
 # MySQL is retained as the rollback path):
-#   */10 * * * * /var/www/performancetracking/pg/scripts/db/pg-backup.sh --tier=10m    >> $HOME/backups/pg-backup.log 2>&1
+#   *    * * * * /var/www/performancetracking/pg/scripts/db/pg-backup.sh --tier=10m    >> $HOME/backups/pg-backup.log 2>&1
 #   5    * * * * /var/www/performancetracking/pg/scripts/db/pg-backup.sh --tier=hourly >> $HOME/backups/pg-backup.log 2>&1
 #   15   2 * * * /var/www/performancetracking/pg/scripts/db/pg-backup.sh --tier=nightly >> $HOME/backups/pg-backup.log 2>&1
+#
+# The 10m tier is the one that runs every minute and decides for itself whether
+# it is DUE, so its interval is not baked into the cron line: the master admin
+# sets it on the System Health page and this script picks it up from
+# ~/pg-standby/backup-config.json (see "frequent-tier interval" below). The other
+# two tiers stay clock-anchored by cron. The 10m prefix in the file name is the
+# tier's stable id, not its current interval — the health page shows the real
+# one — and keeping it preserves the naming/retention the page already matches.
 #
 # Running with no arguments keeps the original behaviour (= --tier=nightly), so
 # the pre-existing cron line and the runbook restore command both still work.
@@ -44,9 +52,10 @@ for arg in "$@"; do
     --tier=*) TIER="${arg#--tier=}" ;;
     --nightly|-n) TIER=nightly ;;
     -h|--help)
-      echo "usage: $(basename "$0") [--tier=10m|hourly|nightly]   (default: nightly)"
+      echo "usage: $(basename "$0") [--tier=10m|hourly|nightly] [--dry-run]   (default: nightly)"
       exit 0
       ;;
+    --dry-run) DRY_RUN=1 ;;
     *) echo "$(date -Iseconds) ERROR: unknown argument '$arg'" >&2; exit 2 ;;
   esac
 done
@@ -56,11 +65,80 @@ case "$TIER" in
   *) echo "$(date -Iseconds) ERROR: unknown tier '$TIER' (expected 10m, hourly or nightly)" >&2; exit 2 ;;
 esac
 
-KEEP_10M="${PG_BACKUP_KEEP_10M:-6}"          # 6 x 10m  = the last hour
 KEEP_HOURLY="${PG_BACKUP_KEEP_HOURLY:-24}"   # 24 x 1h  = the last day
 KEEP_DAYS="${PG_BACKUP_KEEP_DAYS:-14}"       # 14 nights
 
+# ---- frequent-tier interval ------------------------------------------------
+# How often the 10m tier actually dumps. Written by the app (System Health →
+# the dump card) into a file shared with the container; read here so the host
+# needs no redeploy to change cadence. Bounds match the endpoint's, so a value
+# the page accepted is never rejected here. Failing closed on an unreadable or
+# silly value means a bad file can only ever slow the tier back to its default —
+# never stop it, and never dump in a tight loop.
+MIN_INTERVAL=1
+MAX_INTERVAL=60
+DEFAULT_INTERVAL=10
+INTERVAL_CONFIG="${PG_BACKUP_CONFIG_FILE:-$HOME/pg-standby/backup-config.json}"
+
+read_interval_minutes() {
+  local minutes=""
+  if [[ -r "$INTERVAL_CONFIG" ]]; then
+    minutes="$(sed -n 's/.*"intervalMinutes"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$INTERVAL_CONFIG" 2>/dev/null | head -1)"
+  fi
+  if [[ ! "$minutes" =~ ^[0-9]+$ ]] || (( minutes < MIN_INTERVAL )) || (( minutes > MAX_INTERVAL )); then
+    minutes="${PG_BACKUP_INTERVAL_MINUTES:-$DEFAULT_INTERVAL}"
+  fi
+  if [[ ! "$minutes" =~ ^[0-9]+$ ]] || (( minutes < MIN_INTERVAL )) || (( minutes > MAX_INTERVAL )); then
+    minutes="$DEFAULT_INTERVAL"
+  fi
+  printf '%s' "$minutes"
+}
+
+INTERVAL_MIN="$DEFAULT_INTERVAL"
+KEEP_10M="${PG_BACKUP_KEEP_10M:-}"
+if [[ "$TIER" == "10m" ]]; then
+  INTERVAL_MIN="$(read_interval_minutes)"
+  # Keep about an hour of the tier (6 files at the 10-minute default, exactly as
+  # before this was configurable) rather than a fixed count that would shrink to
+  # minutes at a short interval or stretch to half a day at a long one.
+  if [[ -z "$KEEP_10M" ]]; then
+    KEEP_10M=$(( (60 + INTERVAL_MIN - 1) / INTERVAL_MIN ))
+    (( KEEP_10M < 2 )) && KEEP_10M=2
+  fi
+fi
+KEEP_10M="${KEEP_10M:-6}"
+
 mkdir -p "$BACKUPS_DIR"
+
+# ---- is the frequent tier due? ---------------------------------------------
+# Cron wakes this tier every minute; elapsed time — not the clock — decides
+# whether to dump, so any interval works, a late or missed cron minute heals
+# itself on the next one, and a failed run is retried a minute later instead of
+# being skipped for a whole window.
+LAST_RUN_FILE=""
+if [[ "$TIER" == "10m" ]]; then
+  INTERVAL_SEC=$(( INTERVAL_MIN * 60 ))
+  LAST_RUN_FILE="$BACKUPS_DIR/.pg-backup-10m.last"
+  NOW="$(date +%s)"
+  LAST_RUN=0
+  [[ -r "$LAST_RUN_FILE" ]] && LAST_RUN="$(cat "$LAST_RUN_FILE" 2>/dev/null || echo 0)"
+  [[ "$LAST_RUN" =~ ^[0-9]+$ ]] || LAST_RUN=0
+  ELAPSED=$(( NOW - LAST_RUN ))
+  # 30s of slack: a cron minute that lands slightly early is still due.
+  if (( LAST_RUN > 0 && ELAPSED < INTERVAL_SEC - 30 )); then
+    echo "$(date -Iseconds) 10m: not due — $((ELAPSED / 60)) of ${INTERVAL_MIN} min elapsed (interval $INTERVAL_CONFIG)"
+    exit 0
+  fi
+fi
+
+if [[ -n "${DRY_RUN:-}" ]]; then
+  if [[ "$TIER" == "10m" ]]; then
+    echo "$(date -Iseconds) $TIER: dry run — due, would dump now (interval ${INTERVAL_MIN} min, keep ${KEEP_10M}, config $INTERVAL_CONFIG)"
+  else
+    echo "$(date -Iseconds) $TIER: dry run — would dump now"
+  fi
+  exit 0
+fi
 
 # One dump per tier at a time. A tier that is still running is skipped rather
 # than stacked up, so a slow dump can never pile up cron jobs behind it.
@@ -114,7 +192,13 @@ if [[ "$SIZE" -lt 1000 ]] || ! gzip -t "$TMP" 2>/dev/null; then
 fi
 
 mv "$TMP" "$FILE"
-echo "$(date -Iseconds) $TIER: wrote $FILE ($SIZE bytes from $SOURCE)"
+echo "$(date -Iseconds) $TIER: wrote $FILE ($SIZE bytes from $SOURCE, interval ${INTERVAL_MIN} min)"
+
+# Only a completed dump resets the due clock — a failure above leaves it due, so
+# the next cron minute retries.
+if [[ -n "$LAST_RUN_FILE" ]]; then
+  date +%s > "$LAST_RUN_FILE"
+fi
 
 # ---- per-tier retention ----------------------------------------------------
 # Names are date-ordered, so a reverse sort lists newest first.

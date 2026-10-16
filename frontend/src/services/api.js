@@ -35,6 +35,10 @@ export const systemAPI = {
   // (1–120). Applies to the next connection attempt — no restart.
   setConnectionTimeout: (seconds) =>
     request('/system/connection-timeout', { method: 'PUT', body: { seconds } }),
+  // How often the frequent PostgreSQL dump runs, in minutes (1–60). Picked up
+  // by the host's per-minute backup cron within a minute.
+  setBackupInterval: (minutes) =>
+    request('/system/backup-interval', { method: 'PUT', body: { minutes } }),
 };
 
 // User Guide content (editable by the super admin)
