@@ -295,9 +295,14 @@ function tlsCertExpiry() {
 // each with its own retention, so there is always a restore point that is
 // minutes, hours and days old:
 //
-//   vas-pg-10m-<date>-<HHMM>.sql.gz    every 10 min   keep newest 6  (last hour)
+//   vas-pg-10m-<date>-<HHMM>.sql.gz    every N min (configurable, default 10) keep ~1 hour of them
 //   vas-pg-hourly-<date>-<HH>.sql.gz   hourly         keep newest 24 (last day)
 //   vas-pg-<date>.sql.gz               nightly        keep 14 days
+//
+// The 10m prefix is the frequent tier's stable id, not its interval: cron wakes
+// it every minute and pg-backup.sh decides whether it is due, using the saved
+// cadence (BACKUP_CONFIG_FILE, defined with the other settings above), which is
+// why the card's title, staleness threshold and retention all derive from it.
 //
 // The legacy MySQL names (vas-<date>.sql.gz) are still counted so the card keeps
 // working during the MySQL rollback window instead of flashing "no backups".
