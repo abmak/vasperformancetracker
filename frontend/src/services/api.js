@@ -31,6 +31,10 @@ export const systemAPI = {
   // Standby copy cadence, in minutes (1–1440). Applies without a daemon restart.
   setStandbyInterval: (minutes) =>
     request('/system/standby-interval', { method: 'PUT', body: { minutes } }),
+  // How long one connection attempt may take before failover fires, in seconds
+  // (1–120). Applies to the next connection attempt — no restart.
+  setConnectionTimeout: (seconds) =>
+    request('/system/connection-timeout', { method: 'PUT', body: { seconds } }),
 };
 
 // User Guide content (editable by the super admin)

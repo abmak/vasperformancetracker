@@ -29,6 +29,46 @@ const MARKER_FILE = process.env.DB_FAILOVER_MARKER
 const PROMOTED_FILE = process.env.DB_PROMOTED_MARKER
   || path.join(path.dirname(MARKER_FILE), 'PROMOTED');
 
+// ---------------------------------------------------------- failover timing --
+// How long ONE connection attempt may take before the failover layer treats
+// that target as unreachable and switches to the other one. This is the knob
+// that sets failover latency: the master admin edits it from System Health, so
+// it lives in a file next to the failover marker (shared with the host and
+// mounted into the container) rather than in the app's env file.
+//
+// Zero is deliberately not allowed: `connectionTimeoutMillis: 0` means "wait
+// forever", which would turn a black-holed primary into a hung request instead
+// of a failover.
+const CONNECTION_CONFIG_FILE = process.env.DB_CONNECTION_CONFIG_FILE
+  || path.join(path.dirname(MARKER_FILE), 'connection-config.json');
+const CONNECT_TIMEOUT_LIMITS = { minSeconds: 1, maxSeconds: 120, defaultSeconds: 10 };
+
+/**
+ * The connection attempt timeout in force, and where it came from.
+ *
+ * Saved config → env (DB_CONNECT_TIMEOUT_MS) → built-in default. `source` is
+ * reported rather than inferred so the page never claims a value was chosen
+ * when it is merely the fallback.
+ */
+function readConnectionConfig() {
+  const cfg = (() => {
+    try { return JSON.parse(fs.readFileSync(CONNECTION_CONFIG_FILE, 'utf8')); } catch (e) { return null; }
+  })();
+  const seconds = Number(cfg && cfg.connectTimeoutSeconds);
+  if (Number.isFinite(seconds)
+    && seconds >= CONNECT_TIMEOUT_LIMITS.minSeconds
+    && seconds <= CONNECT_TIMEOUT_LIMITS.maxSeconds) {
+    return { ms: Math.round(seconds * 1000), source: 'config', updatedAt: cfg.updatedAt || null, updatedBy: cfg.updatedBy || null };
+  }
+  const envMs = Number(process.env.DB_CONNECT_TIMEOUT_MS);
+  if (Number.isFinite(envMs) && envMs >= CONNECT_TIMEOUT_LIMITS.minSeconds * 1000) {
+    return { ms: Math.round(envMs), source: 'env', updatedAt: null, updatedBy: null };
+  }
+  return { ms: CONNECT_TIMEOUT_LIMITS.defaultSeconds * 1000, source: 'default', updatedAt: null, updatedBy: null };
+}
+
+let connectionConfig = readConnectionConfig();
+
 const CONNECTION_ERROR_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH',
   'ENETUNREACH', 'EPIPE', 'EAI_AGAIN', '57P01', '57P02', '57P03', '08006', '08001'
@@ -43,7 +83,7 @@ function makePool(host, port) {
     database: process.env.DB_NAME || 'vas_revenue_tracking',
     max: 20,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
+    connectionTimeoutMillis: connectionConfig.ms,
   });
 }
 
@@ -72,7 +112,55 @@ let active = pools[activeName];
 let standbyPromoted = fs.existsSync(PROMOTED_FILE);
 
 function isConnectionError(err) {
+  // pg-pool replaces a connection timeout with `new Error('Connection terminated
+  // due to connection timeout')` and gives it no `code`, so the message check is
+  // what catches a *timed-out* attempt (the case this knob controls) — not just
+  // a refused or reset one.
   return Boolean(err && (CONNECTION_ERROR_CODES.has(err.code) || err.message?.includes('Connection terminated')));
+}
+
+/** The live state of the connection attempt timeout, for the health endpoint. */
+function connectionTimeoutState() {
+  // Report what the running pools actually hold rather than what we intended:
+  // this is the value pg reads when it opens the next connection.
+  const liveMs = Number(pools.primary.options.connectionTimeoutMillis);
+  return {
+    milliseconds: liveMs,
+    seconds: liveMs / 1000,
+    source: connectionConfig.source,
+    updatedAt: connectionConfig.updatedAt,
+    updatedBy: connectionConfig.updatedBy,
+    minSeconds: CONNECT_TIMEOUT_LIMITS.minSeconds,
+    maxSeconds: CONNECT_TIMEOUT_LIMITS.maxSeconds,
+    defaultSeconds: CONNECT_TIMEOUT_LIMITS.defaultSeconds,
+    configFile: CONNECTION_CONFIG_FILE,
+  };
+}
+
+/**
+ * Bring the running pools in line with the saved config.
+ *
+ * pg reads `connectionTimeoutMillis` when it *creates* a client, so writing the
+ * pool's option is enough: the next connection attempt uses the new value while
+ * clients already checked out — and the queries running on them — are untouched.
+ * That is why this does not rebuild the pools, which would mean draining them
+ * under live traffic.
+ *
+ * Called on startup, after a save, and on every health check — so a hand-edit of
+ * the file on the VPS is picked up too, and a deleted file falls back cleanly.
+ */
+function reconcileConnectionTimeout() {
+  const next = readConnectionConfig();
+  const changed = next.ms !== connectionConfig.ms;
+  if (changed) {
+    for (const name of Object.keys(pools)) {
+      pools[name].options.connectionTimeoutMillis = next.ms;
+    }
+    console.warn('[db-failover] connection attempt timeout '
+      + connectionConfig.ms + 'ms → ' + next.ms + 'ms (source: ' + next.source + ')');
+  }
+  connectionConfig = next;
+  return { changed, ...connectionTimeoutState() };
 }
 
 /**
@@ -436,6 +524,11 @@ module.exports = new Proxy({}, {
       };
     }
     if (prop === '__promoteStandby') return promoteStandby;
+    // Admin-tunable connection attempt timeout (System Health).
+    if (prop === '__connectionTimeout') return connectionTimeoutState;
+    if (prop === '__reconcileConnectionTimeout') return reconcileConnectionTimeout;
+    if (prop === '__connectTimeoutLimits') return CONNECT_TIMEOUT_LIMITS;
+    if (prop === '__connectTimeoutConfigFile') return CONNECTION_CONFIG_FILE;
     if (prop === 'query' || prop === 'execute') {
       return (sql, params) => runWithRetryAsync((pool) => executeQueryOnPool(pool, sql, params));
     }

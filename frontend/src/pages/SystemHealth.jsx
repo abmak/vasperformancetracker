@@ -148,6 +148,10 @@ export default function SystemHealth() {
   // The 15-second auto-refresh must not type over the operator's edit.
   const [intervalDirty, setIntervalDirty] = useState(false);
   const [intervalBusy, setIntervalBusy] = useState(false);
+  // Failover connection attempt timeout (seconds)
+  const [timeoutDraft, setTimeoutDraft] = useState('');
+  const [timeoutDirty, setTimeoutDirty] = useState(false);
+  const [timeoutBusy, setTimeoutBusy] = useState(false);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -197,6 +201,25 @@ export default function SystemHealth() {
       setIntervalBusy(false);
     }
   }, [intervalDraft, load]);
+
+  const saveTimeout = useCallback(async () => {
+    const seconds = Number(timeoutDraft);
+    if (!Number.isInteger(seconds)) {
+      toast.error('Enter a whole number of seconds');
+      return;
+    }
+    setTimeoutBusy(true);
+    try {
+      const r = await systemAPI.setConnectionTimeout(seconds);
+      toast.success(`Failover timeout saved: a connection attempt is given ${r.seconds}s before the app fails over`);
+      setTimeoutDirty(false);
+      await load();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setTimeoutBusy(false);
+    }
+  }, [timeoutDraft, load]);
 
   useEffect(() => {
     load();
@@ -250,6 +273,22 @@ export default function SystemHealth() {
     if (!standbySync || intervalDirty) return;
     setIntervalDraft(String(standbySync.minutes));
   }, [standbySync, intervalDirty]);
+
+  // How long one connection attempt may take before failover fires. Lives on
+  // the failover layer (it is what decides when the primary counts as dead).
+  const connTimeout = data?.failover?.connectionTimeout;
+  const timeoutSeconds = connTimeout?.seconds ?? 10;
+  const timeoutIsSaved = connTimeout?.source === 'config';
+  const timeoutSource = timeoutIsSaved
+    ? `saved by ${connTimeout.updatedBy || 'a master admin'}${connTimeout.updatedAt ? ' · ' + new Date(connTimeout.updatedAt).toLocaleString() : ''}`
+    : connTimeout?.source === 'env'
+      ? 'from DB_CONNECT_TIMEOUT_MS on the server'
+      : 'built-in default — nobody has set one yet';
+
+  useEffect(() => {
+    if (!connTimeout || timeoutDirty) return;
+    setTimeoutDraft(String(connTimeout.seconds));
+  }, [connTimeout, timeoutDirty]);
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -362,6 +401,10 @@ export default function SystemHealth() {
                   {data.app?.databaseReachable === false && (
                     <span className="font-semibold text-red-600"> · DB unreachable</span>
                   )}
+                </div>
+                <div className="mt-0.5">
+                  Failover after:{' '}
+                  <span className="font-semibold text-gray-700">{timeoutSeconds}s</span> without a connection
                 </div>
               </div>
             </div>
@@ -535,7 +578,7 @@ export default function SystemHealth() {
             </div>
           )}
 
-          {/* Sync controller + copy cadence + pm2 services */}
+          {/* Sync controller + failover timing + copy cadence + pm2 services */}
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
             <div className="rounded-xl border border-gray-200 bg-white p-4">
               <div className="flex items-center justify-between">
@@ -573,6 +616,54 @@ export default function SystemHealth() {
               {!replicationReady && (
                 <div className="mt-2 text-xs text-blue-700">Streaming replication runs on the production VPS only.</div>
               )}
+            </div>
+
+            <div className="rounded-xl border border-gray-200 bg-white p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                  <Clock className="w-4 h-4 text-gray-500" />
+                  Failover timeout
+                </div>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">
+                  {timeoutSeconds}s
+                </span>
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                How long a single connection attempt may take before the app treats that database as
+                unreachable and fails over to the other one. Lower means a faster switch and a greater
+                chance of moving on a brief blip; the minimum is 1 second, because 0 would wait forever
+                and hang requests instead of failing over. Applies to the next connection attempt, with
+                no restart.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input
+                  type="number"
+                  min={connTimeout?.minSeconds ?? 1}
+                  max={connTimeout?.maxSeconds ?? 120}
+                  value={timeoutDraft}
+                  onChange={(e) => { setTimeoutDraft(e.target.value); setTimeoutDirty(true); }}
+                  className="w-24 px-2.5 py-1.5 text-sm rounded-lg border border-gray-200 focus:border-emerald-500 focus:outline-none"
+                />
+                <span className="text-xs text-gray-500">
+                  seconds ({connTimeout?.minSeconds ?? 1}–{connTimeout?.maxSeconds ?? 120})
+                </span>
+                <button
+                  onClick={saveTimeout}
+                  disabled={timeoutBusy || !timeoutDirty}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {timeoutBusy && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  Save
+                </button>
+                {timeoutDirty && <span className="text-xs text-amber-700">unsaved</span>}
+              </div>
+              <div className="mt-2 text-xs text-gray-400">
+                currently: {timeoutSeconds}s · {timeoutSource}
+              </div>
+              <div className="mt-1 text-xs text-gray-400">
+                The liveness probes on this page keep their own 4-second limit, so a long timeout here can
+                never make the panel hang.
+              </div>
             </div>
 
             <div className="rounded-xl border border-gray-200 bg-white p-4">
@@ -687,8 +778,11 @@ export default function SystemHealth() {
           <div className="rounded-xl border border-gray-200 bg-white p-4 text-xs text-gray-600 leading-relaxed">
             <span className="font-semibold text-gray-800">How failover works here: </span>
             the standby streams the primary's write-ahead log continuously, so it is only ever a moment
-            behind — there is no copy interval to wait out. If the primary becomes unreachable, the next API
-            request moves to the standby: the replica is promoted first (a read-only replica rejects writes),
+            behind — there is no copy interval to wait out. If a connection attempt to the primary does not
+            complete within{' '}
+            <span className="font-semibold text-gray-700">{timeoutSeconds} seconds</span>
+            {' '}(the failover timeout above, {timeoutIsSaved ? 'your saved value' : 'the built-in default'}),
+            the app treats it as unreachable and the next API request moves to the standby: the replica is promoted first (a read-only replica rejects writes),
             then serves, so a user loses at most that one request. Once the primary is healthy again it is
             restored <em>from</em> the standby, so nothing written during the outage is lost, and the app
             switches back automatically. If the standby had to be promoted, it owns data the old primary never

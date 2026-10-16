@@ -36,6 +36,14 @@ const BACKUPS_DIR = process.env.BACKUPS_DIR || path.join(HOME, 'backups');
 const SYNC_CONFIG_FILE = process.env.DB_SYNC_CONFIG_FILE
   || path.join(path.dirname(STATUS_FILE), 'sync-config.json');
 
+// How long one connection attempt may take before the app treats that database
+// as unreachable and fails over. The pools (and therefore the bounds) are owned
+// by backend/src/config/database.js, so they are read from there instead of
+// being duplicated here — the page can never save a value the pool rejects.
+const CONNECT_TIMEOUT_LIMITS = db.__connectTimeoutLimits || {
+  minSeconds: 1, maxSeconds: 120, defaultSeconds: 10,
+};
+
 function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
@@ -499,6 +507,10 @@ router.get('/health', requireMasterAdmin, async (req, res) => {
         // failing back needs an operator to rebuild the primary first.
         standbyPromoted: Boolean(db.__standbyPromoted),
         failbackAllowed: db.__failbackAllowed !== false,
+        // How long a connection attempt may take before the app declares a
+        // database unreachable and moves to the other one. Reconciled here so a
+        // hand-edited config file on the VPS is picked up on the next refresh.
+        connectionTimeout: db.__reconcileConnectionTimeout(),
       },
       instances: {
         primary: primary && {
@@ -659,6 +671,58 @@ router.put('/standby-interval', requireMasterAdmin, async (req, res) => {
     previousMinutes: previous.minutes,
     pickupSeconds: SYNC_INTERVAL_PICKUP_SECONDS,
   });
+});
+
+// Connection attempt timeout — how long the app waits for a database connection
+// before treating that target as unreachable and failing over to the other one.
+//
+// This is the failover *latency* knob: a lower value moves traffic to the standby
+// sooner, and one that is too low fails over on a transient blip. 1 second is the
+// floor on purpose — a 0 would mean "wait forever", turning a black-holed primary
+// into hung requests instead of a failover.
+//
+// The value goes to a JSON file next to the failover marker, and the pool is
+// re-pointed at it immediately: pg reads the option when it opens the *next*
+// connection, so nothing already in flight is disturbed and no restart is needed.
+router.put('/connection-timeout', requireMasterAdmin, async (req, res) => {
+  const { minSeconds, maxSeconds } = CONNECT_TIMEOUT_LIMITS;
+  const seconds = Number(req.body ? req.body.seconds : undefined);
+  if (!Number.isInteger(seconds) || seconds < minSeconds || seconds > maxSeconds) {
+    return res.status(400).json({
+      error: `seconds must be a whole number between ${minSeconds} and ${maxSeconds}`,
+    });
+  }
+
+  const previous = db.__connectionTimeout();
+  const configFile = db.__connectTimeoutConfigFile;
+  const updatedBy = (req.user && (req.user.email || req.user.username)) || 'master admin';
+  const payload = { connectTimeoutSeconds: seconds, updatedAt: new Date().toISOString(), updatedBy };
+
+  // Write-then-rename: the file is read on every health check, so a partial
+  // write would otherwise look like "no config — fall back to the default".
+  const tmp = configFile + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, configFile);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* nothing to clean up */ }
+    console.error('[system-connection-timeout]', e);
+    return res.status(500).json({ error: 'could not save ' + configFile + ': ' + e.message });
+  }
+
+  // Apply to the live pools, then report what they actually hold.
+  const applied = db.__reconcileConnectionTimeout();
+
+  try {
+    await recordFailoverEvent(
+      'INFO',
+      `Failover connection timeout changed ${previous.seconds}s → ${applied.seconds}s by ${updatedBy}`,
+      { configFile, previousSource: previous.source, source: applied.source }
+    );
+  } catch (e) { /* best-effort audit trail */ }
+
+  res.json({ ok: true, ...applied, previousSeconds: previous.seconds });
 });
 
 module.exports = router;
